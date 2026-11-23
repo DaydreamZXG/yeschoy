@@ -8,8 +8,8 @@ const root = resolve(import.meta.dirname, '../..');
 const directory = resolve(homedir(), '.config/yeschoy-release/updater-v2');
 const backup = resolve(homedir(), '.config/yeschoy-release/updater-v2-backup');
 const [action, variant, artifact] = process.argv.slice(2);
-if (!['init', 'sign'].includes(action) || !['official', 'partner'].includes(variant)) {
-  throw new Error('Usage: node local-signing.mjs init|sign official|partner [artifact]');
+if (!['init', 'sign'].includes(action) || !['official', 'partner', 'community'].includes(variant)) {
+  throw new Error('Usage: node local-signing.mjs init|sign official|partner|community [artifact]');
 }
 process.umask(0o077);
 for (const path of [directory, backup]) {
@@ -47,7 +47,10 @@ for (const suffix of ['', '.pub']) {
 }
 if (action === 'sign') {
   const registry = JSON.parse(readFileSync(`${root}/src-tauri/update-channels.json`, 'utf8'));
-  if (registry[variant]?.publicKey !== publicKey) throw new Error('Signing key does not match the compiled channel');
+  const expected = variant === 'community'
+    ? readFileSync(`${root}/src-tauri/community-updater.pub`, 'utf8').trim()
+    : registry[variant]?.publicKey;
+  if (expected !== publicKey) throw new Error('Signing key does not match the compiled channel');
   if (!artifact || !lstatSync(artifact).isFile() || lstatSync(artifact).isSymbolicLink()) throw new Error('Regular artifact required');
   if (existsSync(`${artifact}.sig`)) throw new Error('Refusing to replace existing signature');
   tauri(['sign', '-f', key, '-p', '', resolve(artifact)]);

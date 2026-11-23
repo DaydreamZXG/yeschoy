@@ -82,7 +82,7 @@ document.querySelector("[data-yeschoy-connect]").addEventListener(
    long-lived tokens in the URL).
 4. If the desktop app is probably not installed (page stays focused), redirects to
    [`https://yeschoy.app/download`](https://yeschoy.app/download) or
-   [GitHub Releases](https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases).
+   [GitHub Releases](https://github.com/DaydreamZXG/yeschoy/releases).
 
 ## Station backend requirements
 
@@ -111,7 +111,7 @@ Codes must be single-use, short TTL (≤ 5 minutes), and bound to the canonical 
 Users without the app installed should get a **public installer** link:
 
 - Primary: [yeschoy.app/download](https://yeschoy.app/download)
-- Alternative: [GitHub Releases](https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases)
+- Alternative: [GitHub Releases](https://github.com/DaydreamZXG/yeschoy/releases)
 
 **Do not** send third-party station users to `ergou.qzz.io` or other official-only
 update infrastructure. Self-built clients should document GitHub (or their own)

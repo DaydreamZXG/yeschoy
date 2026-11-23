@@ -9,12 +9,12 @@
 | 公开（社区）构建，默认 | `pnpm build` | GitHub Releases `latest.json`（需构建时提供 `YESCHOY_COMMUNITY_UPDATER_PUBKEY`，否则自动更新关闭，界面提示去 GitHub 下载） | 关闭，只走官方下载源 | 关闭，用内置目录 |
 | 官方 / 合作方包 | `deploy/self-update/build-local.mjs`（会设 `YESCHOY_DISTRIBUTION=official\|partner`） | `src-tauri/update-channels.json` 里的官方源 | `YESCHOY_APP_MIRROR_HOST`、`YESCHOY_APP_MIRROR_ADDR` | `YESCHOY_MODEL_CATALOG_URL` |
 
-可选的构建期变量：`YESCHOY_GITHUB_REPO`（默认 `DaydreamZXG/yeschoy-ai-desktop`）。
+可选的构建期变量：`YESCHOY_GITHUB_REPO`（默认 `DaydreamZXG/yeschoy`）。
 
 ## 发官方包之前要做的事（只做一次）
 
 1. 在 GitHub 仓库 Settings → Secrets and variables → Actions → **Variables** 里新建 `DEPLOY_HOST`，值填下载服务器地址。发版流程不再把 IP 写在源码里。
-2. 远程模型目录：在同一页 **Variables** 里新建 `YESCHOY_MODEL_CATALOG_URL`，官方仓库填 `https://ergou.qzz.io/apps/model-catalog.json`。`yeschoy-release.yml` 的 windows/macos 打包步骤只在官方仓库（`DaydreamZXG/yeschoy-ai-desktop`）读取它；fork 或变量为空时不编入地址，客户端只用内置目录。**其他站点不要填 ergou 的地址**，要用远程目录请换成自己的 https 地址并自己发布。本地 `build-local.mjs` 同样读这个环境变量（必须 https://，空值不编入）。
+2. 远程模型目录：在同一页 **Variables** 里新建 `YESCHOY_MODEL_CATALOG_URL`，官方仓库填 `https://ergou.qzz.io/apps/model-catalog.json`。`yeschoy-release.yml` 的 windows/macos 打包步骤只在官方仓库（`DaydreamZXG/yeschoy`）读取它；fork 或变量为空时不编入地址，客户端只用内置目录。**其他站点不要填 ergou 的地址**，要用远程目录请换成自己的 https 地址并自己发布。本地 `build-local.mjs` 同样读这个环境变量（必须 https://，空值不编入）。
    - 客户端行为：启动时拉取 `<地址>` 和 `<地址>.sha256`，sha256 不符、schema 不合法、`verifiedAt` 不比当前新、网络失败时都保留当前目录（缓存或内置），不会变空。
    - 发布：`node scripts/ops/publish-model-catalog.mjs --to /srv/yeschoy-download/public/apps`（在下载服务器上执行），发布前把 `catalog.json` 的 `verifiedAt` 改成新日期。
 3. 如果官方包要用安装包镜像，把 `YESCHOY_APP_MIRROR_HOST`、`YESCHOY_APP_MIRROR_ADDR` 作为 env 加到上述打包步骤里（值从仓库变量读取）。不加也能用，只是没有镜像。
@@ -58,7 +58,7 @@ scripts/oss/clean-history.sh ../yeschoy-oss product/yeschoy-v1
 
 本仓库若对社区可见，请在 GitHub 打开防护（文档步骤；**不能**靠合并本 PR 自动打开）：
 
-1. 打开 <https://github.com/DaydreamZXG/yeschoy-ai-desktop/settings/security_analysis>
+1. 打开 <https://github.com/DaydreamZXG/yeschoy/settings/security_analysis>
 2. 启用 **Secret scanning**
 3. 启用 **Push protection**（阻止把已知密钥形态推进仓库）
 4. （建议）启用 **Dependabot alerts** / security updates
@@ -67,7 +67,7 @@ scripts/oss/clean-history.sh ../yeschoy-oss product/yeschoy-v1
 
 ## Git 历史说明（不在本 PR 改写真实仓库）
 
-真实 `DaydreamZXG/yeschoy-ai-desktop` **不强制** `git filter-repo`。开源对外「干净起点」推荐：
+真实 `DaydreamZXG/yeschoy` **不强制** `git filter-repo`。开源对外「干净起点」推荐：
 
 ```bash
 scripts/oss/clean-history.sh ../yeschoy-oss product/yeschoy-v1

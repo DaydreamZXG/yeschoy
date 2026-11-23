@@ -1,10 +1,8 @@
-name: Yeschoy Release
+name: YesChoy Release
 
-# Builds both editions (official / partner) exactly like deploy/self-update:
-# Windows via cargo-xwin + custom NSIS on Linux, macOS universal app + DMG
-# signed and notarized, every updater artifact minisign-signed with the
-# edition's own key. `dry-run` stops after a verified candidate; `publish`
-# additionally pushes to ergou.qzz.io after manual approval.
+# 社区版（唯一发行版）：Windows 在 Linux 上用 cargo-xwin + 自定义 NSIS 打包，
+# macOS 打双架构 App + DMG 并签名公证，更新构件用社区版密钥签名。
+# `dry-run` 只打包和校验；`publish` 在审批后发 GitHub Release（含应用内更新用的 latest.json）。
 
 on:
   workflow_dispatch:
@@ -44,11 +42,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Require release from product/yeschoy-v1
+      - name: Require release from main
         if: inputs.mode == 'publish'
         run: |
-          if [ "$GITHUB_REF" != "refs/heads/product/yeschoy-v1" ]; then
-            echo "::error::Publishing is only allowed from product/yeschoy-v1 (got $GITHUB_REF)."
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Publishing is only allowed from main (got $GITHUB_REF)."
             exit 1
           fi
       - name: Version identity and notes
@@ -71,20 +69,21 @@ jobs:
           const notes = (process.env.RELEASE_NOTES || '').trim();
           if (notes.length < 1 || notes.length > 600) throw new Error(`release notes must be 1-600 characters, got ${notes.length}`);
           NODE
-      - name: Must be newer than what is live
+      - name: Must be newer than the latest GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for variant in official partner; do
-            live="$(curl -fsS --retry 3 "https://ergou.qzz.io/updates/$variant/stable.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' || echo 0.0.0)"
-            python3 - "$RELEASE_VERSION" "$live" "$variant" <<'PY'
+          live="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null | sed 's/^v//' || true)"
+          live="${live:-0.0.0}"
+          python3 - "$RELEASE_VERSION" "$live" <<'PY'
           import sys
-          new, live, variant = sys.argv[1:]
+          new, live = sys.argv[1:]
           key = lambda v: tuple(int(x) for x in v.split('.'))
           if key(new) <= key(live):
-              sys.exit(f"::error::{variant}: {new} is not newer than the live {live}")
-          print(f"{variant}: live {live} -> {new}")
+              sys.exit(f"::error::{new} is not newer than the latest release {live}")
+          print(f"latest release {live} -> {new}")
           PY
-          done
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
@@ -101,7 +100,7 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
   renderer:
-    name: Renderer production build (shared by every edition)
+    name: Renderer production build
     needs: gate
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -115,8 +114,6 @@ jobs:
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - run: pnpm install --frozen-lockfile
       - run: pnpm build:renderer
-        env:
-          VITE_YESCHOY_DISTRIBUTION: official
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: renderer-dist
@@ -134,10 +131,8 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - variant: official
-            key_secret: UPDATER_KEY_OFFICIAL
-          - variant: partner
-            key_secret: UPDATER_KEY_PARTNER
+          - variant: community
+            key_secret: UPDATER_KEY_COMMUNITY
     env:
       UPDATER_KEY: ${{ secrets[matrix.key_secret] }}
     steps:
@@ -175,7 +170,7 @@ jobs:
         run: node deploy/self-update/build-local.mjs windows "${{ matrix.variant }}" "$GITHUB_WORKSPACE/$OUT"
         env:
           # 远程模型目录：只在官方仓库、且设置了仓库变量时编入；为空则客户端只用内置目录。
-          YESCHOY_MODEL_CATALOG_URL: ${{ github.repository == 'DaydreamZXG/yeschoy-ai-desktop' && vars.YESCHOY_MODEL_CATALOG_URL || '' }}
+          YESCHOY_MODEL_CATALOG_URL: ${{ github.repository == 'DaydreamZXG/yeschoy' && vars.YESCHOY_MODEL_CATALOG_URL || '' }}
       - name: Show build log on failure
         if: failure()
         run: tail -n 200 "$OUT"/windows/evidence/*-build.log || true
@@ -201,10 +196,8 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - variant: official
-            key_secret: UPDATER_KEY_OFFICIAL
-          - variant: partner
-            key_secret: UPDATER_KEY_PARTNER
+          - variant: community
+            key_secret: UPDATER_KEY_COMMUNITY
     env:
       UPDATER_KEY: ${{ secrets[matrix.key_secret] }}
       APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
@@ -283,7 +276,7 @@ jobs:
         run: node deploy/self-update/build-local.mjs macos "${{ matrix.variant }}" "$GITHUB_WORKSPACE/$OUT"
         env:
           # 远程模型目录：只在官方仓库、且设置了仓库变量时编入；为空则客户端只用内置目录。
-          YESCHOY_MODEL_CATALOG_URL: ${{ github.repository == 'DaydreamZXG/yeschoy-ai-desktop' && vars.YESCHOY_MODEL_CATALOG_URL || '' }}
+          YESCHOY_MODEL_CATALOG_URL: ${{ github.repository == 'DaydreamZXG/yeschoy' && vars.YESCHOY_MODEL_CATALOG_URL || '' }}
       - name: Notarize the app
         run: |
           root="$GITHUB_WORKSPACE/$OUT/macos"
@@ -326,11 +319,14 @@ jobs:
           if [ -n "${KEYCHAIN_PATH:-}" ]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
           rm -rf ~/.config/yeschoy-release
 
-  candidate:
-    name: Assemble and verify the 12-file candidate
+  release:
+    name: Assemble latest.json and publish the GitHub release
     needs: [windows, macos]
-    runs-on: macos-14
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    environment: ${{ inputs.mode == 'publish' && 'yeschoy-release' || '' }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -345,130 +341,26 @@ jobs:
           pattern: mac-*
           merge-multiple: true
           path: ${{ env.OUT }}/macos
-      - name: prepare-candidate.mjs
-        run: node deploy/self-update/prepare-candidate.mjs "$GITHUB_WORKSPACE/$OUT"
-      - name: Trial promotion of both editions into a throwaway root seeded from live
+      - name: Collect assets, verify signatures, write latest.json
         env:
           RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           set -euo pipefail
-          brew install minisign
-          trial="$RUNNER_TEMP/trial/public"
-          mkdir -p "$trial/updates/official" "$trial/updates/partner" "$trial/releases"
-          curl -fsS --retry 3 -o "$trial/health.json" https://ergou.qzz.io/health.json
-          for v in official partner; do
-            curl -fsS --retry 3 -o "$trial/updates/$v/stable.json" "https://ergou.qzz.io/updates/$v/stable.json"
-            curl -fsS --retry 3 -o "$trial/releases/yeschoy-$v.json" "https://ergou.qzz.io/releases/yeschoy-$v.json"
-          done
-          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.txt"
-          cd deploy/self-update
-          for v in official partner; do
-            python3 publish_variant.py publish --root "$trial" --variant "$v" --lock "$RUNNER_TEMP/trial/publish.lock" \
-              --candidate "$GITHUB_WORKSPACE/$OUT/candidate" --version "$RELEASE_VERSION" \
-              --notes "$RUNNER_TEMP/release-notes.txt" --channel-config "$GITHUB_WORKSPACE/src-tauri/update-channels.json" \
-              --minisign "$(command -v minisign)"
-          done
-      - name: Checksums
-        run: cd "$OUT/candidate" && shasum -a 256 ./* > ../SHA256SUMS.txt && cat ../SHA256SUMS.txt
+          sudo apt-get update -q && sudo apt-get install -y -q minisign
+          node deploy/self-update/community-release.mjs "$GITHUB_WORKSPACE/$OUT" "$RELEASE_VERSION" "$GITHUB_REPOSITORY" "$(command -v minisign)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: candidate-${{ inputs.version }}
-          path: |
-            ${{ env.OUT }}/candidate
-            ${{ env.OUT }}/candidate-receipt.json
-            ${{ env.OUT }}/SHA256SUMS.txt
+          name: release-${{ inputs.version }}
+          path: ${{ env.OUT }}/release
           if-no-files-found: error
           retention-days: 30
-
-  publish:
-    name: Publish to ergou.qzz.io (approval required)
-    needs: candidate
-    if: inputs.mode == 'publish'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    environment: yeschoy-release
-    env:
-      # 下载服务器地址放在仓库变量里，不写进公开仓库。
-      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
-      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-      RELEASE_NOTES: ${{ inputs.notes }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Require deploy secrets
-        run: scripts/ci/require-secrets.sh "Publish" DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DEPLOY_USER DEPLOY_HOST
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: candidate-${{ inputs.version }}
-          path: upload
-      - name: Pinned SSH trust
-        run: |
-          set -euo pipefail
-          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::DEPLOY_USER is not a valid user name"; exit 1; }
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
-          printf '%s\n' "$RELEASE_NOTES" > upload/release-notes.txt
-          cp src-tauri/update-channels.json upload/update-channels.json
-      - name: Stage files in incoming/
-        id: stage
-        run: |
-          set -euo pipefail
-          stage="/opt/yeschoy-download/incoming/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          opts=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
-          # shellcheck disable=SC2029 # values are expanded locally on purpose
-          ssh "${opts[@]}" "$DEPLOY_USER@$DEPLOY_HOST" "install -d -m 700 '$stage' '$stage/candidate'"
-          scp "${opts[@]}" upload/candidate/* "$DEPLOY_USER@$DEPLOY_HOST:$stage/candidate/"
-          scp "${opts[@]}" upload/release-notes.txt upload/update-channels.json "$DEPLOY_USER@$DEPLOY_HOST:$stage/"
-          echo "stage=$stage" >> "$GITHUB_OUTPUT"
-      - name: Publish official, then partner (root-owned wrapper on the server)
+      - name: Create the GitHub release
+        if: inputs.mode == 'publish'
         env:
-          STAGE: ${{ steps.stage.outputs.stage }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ inputs.notes }}
         run: |
           set -euo pipefail
-          opts=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
-          for v in official partner; do
-            # shellcheck disable=SC2029 # values are expanded locally on purpose
-            ssh "${opts[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
-              "sudo -n /opt/yeschoy-download/bin/yeschoy-publish $v '$STAGE/candidate' '$RELEASE_VERSION' '$STAGE/release-notes.txt' '$STAGE/update-channels.json'" \
-              | tee "receipt-$v.json"
-          done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: publish-receipts-${{ inputs.version }}
-          path: receipt-*.json
-          if-no-files-found: ignore
-          retention-days: 90
-      - name: Remove SSH key
-        if: always()
-        run: rm -f ~/.ssh/id_ed25519
-
-  probe:
-    name: Probe the public release
-    needs: publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: candidate-${{ inputs.version }}
-          path: candidate-artifact
-      - name: probe_variant_release.py
-        run: |
-          set -euo pipefail
-          sudo apt-get update -q && sudo apt-get install -y -q minisign
-          python3 deploy/self-update/probe_variant_release.py --version "$RELEASE_VERSION" \
-            --channel-config src-tauri/update-channels.json --candidate candidate-artifact/candidate \
-            --minisign "$(command -v minisign)"
-      - name: How to roll back
-        if: failure()
-        run: |
-          echo "::error::The public probe failed. On the server, roll back each edition with the manifestSha256 from the publish-receipts artifact:"
-          echo "python3 /opt/yeschoy-download/bin/publish_variant.py rollback --root /srv/yeschoy-download/public --variant <official|partner> --lock /opt/yeschoy-download/publish.lock --expected-sha256 <manifestSha256>"
+          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/notes.txt"
+          gh release create "v$RELEASE_VERSION" "$OUT"/release/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "YesChoy $RELEASE_VERSION" --notes-file "$RUNNER_TEMP/notes.txt" --latest

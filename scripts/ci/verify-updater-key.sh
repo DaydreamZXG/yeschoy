@@ -11,8 +11,11 @@ echo "yeschoy key probe $variant $(date +%s)" > "$work/probe.txt"
 node "$repo/deploy/self-update/local-signing.mjs" sign "$variant" "$work/probe.txt" > /dev/null
 node -e '
 const fs = require("fs");
-const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-fs.writeFileSync(process.argv[3], Buffer.from(r[process.argv[2]].publicKey, "base64"));
+const variant = process.argv[2];
+const key = variant === "community"
+  ? fs.readFileSync(process.argv[1].replace(/update-channels\.json$/, "community-updater.pub"), "utf8").trim()
+  : (JSON.parse(fs.readFileSync(process.argv[1], "utf8"))[variant] || {}).publicKey;
+fs.writeFileSync(process.argv[3], Buffer.from(key, "base64"));
 ' "$repo/src-tauri/update-channels.json" "$variant" "$work/key.pub"
 base64 --decode < "$work/probe.txt.sig" > "$work/probe.minisig"
 if ! minisign -Vm "$work/probe.txt" -x "$work/probe.minisig" -p "$work/key.pub" > /dev/null; then
