@@ -62,6 +62,7 @@ function buildEvidence(target) {
   const latest = outputs[0];
   assert(latest);
   assert(readFileSync(latest, 'utf8').split(/\r?\n/).includes(`cargo:rustc-env=YESCHOY_AUTHORIZATION_PAGE_ORIGIN=${origin}`));
+  assert(readFileSync(latest, 'utf8').split(/\r?\n/).includes(`cargo:rustc-env=YESCHOY_DISTRIBUTION=${community ? 'community' : variant}`));
   copyFileSync(latest, `${folder}/evidence/${variant}-${target}-build-output.txt`);
   return { target, authorizationPageOrigin: origin, buildOutputSha256: hash(latest), output: latest };
 }
