@@ -84,6 +84,39 @@ describe("resolveDesktopDownloads", () => {
     expect(result.githubUnpublished).toBe(false);
   });
 
+  it("serves the community installers to partner visitors too", async () => {
+    const base = "https://github.com/DaydreamZXG/yeschoy/releases/download/v0.5.2/";
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("api.github.com")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              tag_name: "v0.5.2",
+              draft: false,
+              published_at: "2026-11-24T00:00:00Z",
+              assets: [
+                "yeschoy-0.5.2-community-windows-x86_64-installer.exe",
+                "yeschoy-0.5.2-community-macos-universal-installer.dmg",
+              ].map((name) => ({ name, browser_download_url: base + name })),
+            },
+          ],
+        };
+      }
+      return { ok: false, json: async () => null };
+    }) as typeof fetch;
+
+    const result = await resolveDesktopDownloads({
+      variant: "partner",
+      userAgent: "Macintosh; Intel Mac OS X",
+      fetchImpl,
+    });
+    expect(result.primary?.source).toBe("github");
+    expect(result.primary?.url).toBe(
+      base + "yeschoy-0.5.2-community-macos-universal-installer.dmg",
+    );
+  });
+
   it("falls back to ergou manifest when GitHub has no published release", async () => {
     const fetchImpl = vi.fn(async (url: string) => {
       if (url.includes("api.github.com")) {

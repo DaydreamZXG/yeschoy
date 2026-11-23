@@ -104,7 +104,7 @@ function pickGithubAsset(
     const name = asset.name ?? "";
     const url = asset.browser_download_url ?? "";
     if (!url.startsWith("https://")) return false;
-    if (!name.includes(token)) return false;
+    if (!name.includes(token) && !name.includes("-community-")) return false;
     if (platform === "windows") {
       return /windows-x86_64-installer\.exe$/i.test(name);
     }
