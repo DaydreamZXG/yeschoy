@@ -189,7 +189,7 @@ jobs:
   macos:
     name: macOS universal app + DMG (${{ matrix.variant }})
     needs: renderer
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 180
     environment: yeschoy-signing
     strategy:
