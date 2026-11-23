@@ -4,8 +4,8 @@
 # Input: UPDATER_KEY = base64 of ~/.config/yeschoy-release/updater-v2/<variant>.key
 # Usage: restore-updater-key.sh official|partner
 set -euo pipefail
-variant="${1:?usage: restore-updater-key.sh official|partner}"
-case "$variant" in official|partner) ;; *) echo "bad variant" >&2; exit 64;; esac
+variant="${1:?usage: restore-updater-key.sh official|partner|community}"
+case "$variant" in official|partner|community) ;; *) echo "bad variant" >&2; exit 64;; esac
 : "${UPDATER_KEY:?UPDATER_KEY is empty}"
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$HOME/.config/yeschoy-release/updater-v2"
@@ -20,8 +20,10 @@ fi
 chmod 600 "$key"
 node -e '
 const fs = require("fs");
-const registry = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-const key = registry[process.argv[2]] && registry[process.argv[2]].publicKey;
+const variant = process.argv[2];
+const key = variant === "community"
+  ? fs.readFileSync(process.argv[1].replace(/update-channels\.json$/, "community-updater.pub"), "utf8").trim()
+  : (JSON.parse(fs.readFileSync(process.argv[1], "utf8"))[variant] || {}).publicKey;
 if (!key) throw new Error("no public key for " + process.argv[2]);
 fs.writeFileSync(process.argv[3], key + "\n", { mode: 0o600 });
 ' "$repo/src-tauri/update-channels.json" "$variant" "$key.pub"

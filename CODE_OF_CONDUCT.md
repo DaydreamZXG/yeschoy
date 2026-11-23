@@ -40,7 +40,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the YesChoy maintainers responsible for enforcement via:
 
-- [GitHub Security Advisories](https://github.com/DaydreamZXG/yeschoy-ai-desktop/security/advisories/new) for sensitive reports; or
+- [GitHub Security Advisories](https://github.com/DaydreamZXG/yeschoy/security/advisories/new) for sensitive reports; or
 - a private request to maintainers (open an Issue titled `[CoC]` and ask to be contacted off-thread).
 
 All complaints will be reviewed and investigated promptly and fairly.
@@ -135,7 +135,7 @@ For answers to common questions about this code of conduct, see the FAQ at [http
 
 辱骂、骚扰或其他不可接受的行为，请向 YesChoy 维护者报告：
 
-- 敏感内容走 [GitHub Security Advisories](https://github.com/DaydreamZXG/yeschoy-ai-desktop/security/advisories/new)；或
+- 敏感内容走 [GitHub Security Advisories](https://github.com/DaydreamZXG/yeschoy/security/advisories/new)；或
 - 开一个标题含 `[CoC]` 的 Issue，说明希望私下联系。
 
 所有投诉都将得到及时和公平的审查和调查。

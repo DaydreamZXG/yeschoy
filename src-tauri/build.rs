@@ -33,7 +33,7 @@ fn main() {
     };
     std::fs::write(out_dir.join("update-channels.json"), channels).unwrap();
     let repo = std::env::var("YESCHOY_GITHUB_REPO")
-        .unwrap_or_else(|_| "DaydreamZXG/yeschoy-ai-desktop".to_owned());
+        .unwrap_or_else(|_| "DaydreamZXG/yeschoy".to_owned());
     let pubkey = std::env::var("YESCHOY_COMMUNITY_UPDATER_PUBKEY").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=YESCHOY_DISTRIBUTION");
     println!("cargo:rerun-if-env-changed=YESCHOY_GITHUB_REPO");

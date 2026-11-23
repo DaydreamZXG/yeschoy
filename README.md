@@ -61,7 +61,7 @@
 ## 下载
 
 - [YesChoy 下载页（yeschoy.app）](https://yeschoy.app/download)（自动识别系统，优先 GitHub 已发布版本，否则走官网备用地址）
-- [GitHub Releases](https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases)
+- [GitHub Releases](https://github.com/DaydreamZXG/yeschoy/releases)
 
 客户端内会自动检查更新：社区自编译版本走 GitHub Releases，官方安装包走官方更新源（见 [`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md)）。下载页源码与部署说明见 [`docs/download-page.md`](docs/download-page.md)。
 
@@ -136,7 +136,7 @@ Skip the terminal commands, config files, and protocol headaches. Enter your sta
 ### Download
 
 - [YesChoy download page (yeschoy.app)](https://yeschoy.app/download) (OS-aware; prefers published GitHub releases)
-- [GitHub Releases](https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases)
+- [GitHub Releases](https://github.com/DaydreamZXG/yeschoy/releases)
 
 See [`docs/download-page.md`](docs/download-page.md) for hosting notes. In-app auto-update: community builds use GitHub Releases; official packages use the official feed (see `docs/OPEN_SOURCE.md`).
 

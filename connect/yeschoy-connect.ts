@@ -12,7 +12,7 @@ export { STATION_CONNECT_PAGE_PATH } from "./stationConnectPage";
 export const DEFAULT_DOWNLOAD_URL = "https://yeschoy.app/download";
 
 export const GITHUB_RELEASES_URL =
-  "https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases";
+  "https://github.com/DaydreamZXG/yeschoy/releases";
 
 export type YeschoyConnectPhase =
   | "idle"

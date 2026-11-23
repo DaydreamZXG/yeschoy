@@ -2,14 +2,14 @@
 
 > [中文版本](#贡献指南)
 
-Thank you for your interest in contributing to [YesChoy AI Desktop](https://github.com/DaydreamZXG/yeschoy-ai-desktop)! Please read our [Code of Conduct](./CODE_OF_CONDUCT.md) before participating.
+Thank you for your interest in contributing to [YesChoy AI Desktop](https://github.com/DaydreamZXG/yeschoy)! Please read our [Code of Conduct](./CODE_OF_CONDUCT.md) before participating.
 
 ## How to Contribute
 
 There are many ways to contribute:
 
-- **Report bugs** — Found something broken? [Open an issue](https://github.com/DaydreamZXG/yeschoy-ai-desktop/issues/new).
-- **Suggest features** — Have an idea? [Open an issue](https://github.com/DaydreamZXG/yeschoy-ai-desktop/issues/new) and describe the use case.
+- **Report bugs** — Found something broken? [Open an issue](https://github.com/DaydreamZXG/yeschoy/issues/new).
+- **Suggest features** — Have an idea? [Open an issue](https://github.com/DaydreamZXG/yeschoy/issues/new) and describe the use case.
 - **Improve docs** — Spot a typo or missing info? Open an issue or send a PR.
 - **Contribute code** — Fix bugs or implement features via pull requests.
 - **Translate** — Help improve translations (English, Simplified Chinese, Traditional Chinese, Japanese).
@@ -128,8 +128,8 @@ Locale files live under `src/i18n/locales/`. When modifying user-facing text:
 
 ## Questions?
 
-- [Open an issue](https://github.com/DaydreamZXG/yeschoy-ai-desktop/issues/new)
-- [GitHub Discussions](https://github.com/DaydreamZXG/yeschoy-ai-desktop/discussions) (if enabled)
+- [Open an issue](https://github.com/DaydreamZXG/yeschoy/issues/new)
+- [GitHub Discussions](https://github.com/DaydreamZXG/yeschoy/discussions) (if enabled)
 
 ---
 
@@ -137,14 +137,14 @@ Locale files live under `src/i18n/locales/`. When modifying user-facing text:
 
 > [English Version](#contributing-to-yeschoy-ai-desktop)
 
-感谢你对 [YesChoy](https://github.com/DaydreamZXG/yeschoy-ai-desktop) 的贡献兴趣！参与之前请阅读我们的[行为准则](./CODE_OF_CONDUCT.md)。
+感谢你对 [YesChoy](https://github.com/DaydreamZXG/yeschoy) 的贡献兴趣！参与之前请阅读我们的[行为准则](./CODE_OF_CONDUCT.md)。
 
 ## 如何贡献
 
 你可以通过多种方式参与贡献：
 
-- **报告 Bug** — 发现问题？[提交 Issue](https://github.com/DaydreamZXG/yeschoy-ai-desktop/issues/new)。
-- **建议功能** — 有想法？[提交 Issue](https://github.com/DaydreamZXG/yeschoy-ai-desktop/issues/new) 并说明使用场景。
+- **报告 Bug** — 发现问题？[提交 Issue](https://github.com/DaydreamZXG/yeschoy/issues/new)。
+- **建议功能** — 有想法？[提交 Issue](https://github.com/DaydreamZXG/yeschoy/issues/new) 并说明使用场景。
 - **改进文档** — 发现错误或缺失？开 Issue 或直接发 PR。
 - **贡献代码** — 通过 Pull Request 修复 Bug 或实现新功能。
 - **翻译** — 帮助改进英文、简体中文、繁体中文和日文的翻译。
@@ -262,5 +262,5 @@ chore(deps): update dependencies
 
 ## 有疑问？
 
-- [提问 / 开 Issue](https://github.com/DaydreamZXG/yeschoy-ai-desktop/issues/new)
-- [GitHub 讨论区](https://github.com/DaydreamZXG/yeschoy-ai-desktop/discussions)（若已开启）
+- [提问 / 开 Issue](https://github.com/DaydreamZXG/yeschoy/issues/new)
+- [GitHub 讨论区](https://github.com/DaydreamZXG/yeschoy/discussions)（若已开启）

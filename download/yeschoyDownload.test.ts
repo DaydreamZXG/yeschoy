@@ -56,12 +56,12 @@ describe("resolveDesktopDownloads", () => {
                 {
                   name: "yeschoy-0.4.29-official-windows-x86_64-installer.exe",
                   browser_download_url:
-                    "https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases/download/v0.4.29/yeschoy-0.4.29-official-windows-x86_64-installer.exe",
+                    "https://github.com/DaydreamZXG/yeschoy/releases/download/v0.4.29/yeschoy-0.4.29-official-windows-x86_64-installer.exe",
                 },
                 {
                   name: "yeschoy-0.4.29-official-macos-universal-installer.dmg",
                   browser_download_url:
-                    "https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases/download/v0.4.29/yeschoy-0.4.29-official-macos-universal-installer.dmg",
+                    "https://github.com/DaydreamZXG/yeschoy/releases/download/v0.4.29/yeschoy-0.4.29-official-macos-universal-installer.dmg",
                 },
               ],
             },

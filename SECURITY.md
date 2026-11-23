@@ -19,14 +19,14 @@ YesChoy 是本地桌面客户端，会在用户确认后修改所选 AI 应用�
 
 ## 报告漏洞
 
-请勿在公开 Issue 中提交密钥、访问令牌、配置文件、服务器地址详情或可直接利用的漏洞步骤。请通过 [GitHub Security Advisories](https://github.com/DaydreamZXG/yeschoy-ai-desktop/security/advisories/new) 私下报告，并提供：
+请勿在公开 Issue 中提交密钥、访问令牌、配置文件、服务器地址详情或可直接利用的漏洞步骤。请通过 [GitHub Security Advisories](https://github.com/DaydreamZXG/yeschoy/security/advisories/new) 私下报告，并提供：
 
 - 受影响版本和操作系统；
 - 不可信输入从哪里进入、经过哪些组件；
 - 最小复现步骤和实际影响；
 - 已做脱敏的日志或截图。
 
-我们会尽量在 48 小时内确认、7 天内给出初步判断。修复会通过 [项目 Releases](https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases) 发布；客户端只接受由内置公钥验证通过、且版本严格递增的更新。
+我们会尽量在 48 小时内确认、7 天内给出初步判断。修复会通过 [项目 Releases](https://github.com/DaydreamZXG/yeschoy/releases) 发布；客户端只接受由内置公钥验证通过、且版本严格递增的更新。
 
 ## 不属于漏洞的情形
 

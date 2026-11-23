@@ -7,10 +7,10 @@
 export const DESKTOP_DOWNLOAD_PAGE_URL = "https://yeschoy.app/download";
 
 export const GITHUB_RELEASES_PAGE =
-  "https://github.com/DaydreamZXG/yeschoy-ai-desktop/releases";
+  "https://github.com/DaydreamZXG/yeschoy/releases";
 
 const GITHUB_RELEASES_API =
-  "https://api.github.com/repos/DaydreamZXG/yeschoy-ai-desktop/releases";
+  "https://api.github.com/repos/DaydreamZXG/yeschoy/releases";
 
 export const ERGOU_OFFICIAL_MANIFEST =
   "https://ergou.qzz.io/releases/yeschoy-official.json";
