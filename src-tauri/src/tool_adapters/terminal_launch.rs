@@ -1,0 +1,936 @@
+//! Explicit launch-only terminal opening. Inputs are native discovery paths;
+//! renderer commands, model requests and credentials are never accepted here.
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+
+use super::{common, AdapterFailure, ResolvedInstallation};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Platform {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    MacOs,
+    Windows,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LaunchPlan {
+    program: String,
+    args: Vec<String>,
+    new_console: bool,
+    working_directory: String,
+    mac_command: Option<String>,
+}
+
+fn failure(reason: &'static str) -> AdapterFailure {
+    AdapterFailure::LaunchError(reason)
+}
+
+fn quoted_shell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_literal(value: &str) -> String {
+    // PowerShell treats Unicode smart quotes as delimiters too. Keep every
+    // native path out of the parser, including quote and metacharacter bytes.
+    format!(
+        "([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')))",
+        STANDARD.encode(value.as_bytes())
+    )
+}
+
+fn windows_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || value.strip_prefix("\\\\").is_some_and(|tail| {
+            let parts: Vec<_> = tail.split('\\').collect();
+            parts.len() >= 2
+                && parts[0] != "."
+                && parts[0] != "?"
+                && !parts[0].is_empty()
+                && !parts[1].is_empty()
+        })
+}
+
+fn path_text(path: &Path, platform: Platform) -> Result<String, AdapterFailure> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| failure("invalid_launch_target"))?;
+    // Canonical Windows discovery may return the extended-length prefix.
+    let value = if platform == Platform::Windows {
+        if let Some(tail) = raw.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{tail}")
+        } else {
+            raw.strip_prefix("\\\\?\\").unwrap_or(raw).to_owned()
+        }
+    } else {
+        raw.to_owned()
+    };
+    let absolute = match platform {
+        Platform::MacOs => value.starts_with('/'),
+        Platform::Windows => windows_absolute(&value),
+    };
+    if !absolute
+        || value.chars().any(char::is_control)
+        || (platform == Platform::Windows && value.contains('"'))
+    {
+        return Err(failure("invalid_launch_target"));
+    }
+    Ok(value)
+}
+
+/// 在终端里开这个应用时要跟在程序后面的固定参数，按先后试：前一种退出码不是 0
+/// 才试后一种。别的应用都是直接开，只有 OpenClaw 不是——它的终端界面默认去连
+/// Gateway，Gateway 没开就发不出消息；`--local` 不用 Gateway，但 Gateway 开着时
+/// 它会拒绝并让人去掉 `--local`（2026.11.6 两种情况都实测过）。
+fn launch_attempts(tool_id: &str) -> &'static [&'static [&'static str]] {
+    match tool_id {
+        "openclaw" => &[&["tui", "--local"], &["tui"]],
+        _ => &[&[]],
+    }
+}
+
+fn with_arguments(program: String, arguments: &[&str]) -> String {
+    std::iter::once(program.as_str())
+        .chain(arguments.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn mac_shell_command(
+    executable: &str,
+    workspace: &str,
+    runtime_directories: &[String],
+    attempts: &[&[&str]],
+) -> String {
+    let prefix = runtime_directories
+        .iter()
+        .map(|directory| quoted_shell(directory))
+        .collect::<Vec<_>>()
+        .join(":");
+    let path = if prefix.is_empty() {
+        "\"${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}\"".to_owned()
+    } else {
+        format!("{prefix}:\"${{PATH:-/usr/bin:/bin:/usr/sbin:/sbin}}\"")
+    };
+    let (last, earlier) = attempts.split_last().unwrap_or((&(&[] as &[&str]), &[]));
+    let invocation = earlier
+        .iter()
+        .map(|arguments| with_arguments(quoted_shell(executable), arguments))
+        .chain(std::iter::once(format!(
+            "exec {}",
+            with_arguments(quoted_shell(executable), last)
+        )))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    format!(
+        "cd -- {} || exit 1\nunset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY\nPATH={path}\nexport PATH\n{invocation}",
+        quoted_shell(workspace),
+    )
+}
+
+fn acceptable_workspace(path: &Path, home: &Path) -> bool {
+    path.is_absolute() && path.is_dir() && path != home && !home.starts_with(path)
+}
+
+fn default_cli_workspace(home: &Path) -> Result<PathBuf, AdapterFailure> {
+    // 以前的名字建的那个文件夹还在就接着用，不在用户的“文档”里再多建一个。
+    for earlier in ["野菜工作区", "开饭工作区"] {
+        let old = home.join("Documents").join(earlier);
+        if old.is_dir() {
+            return Ok(old);
+        }
+    }
+    let path = home.join("Documents").join("YesChoy 工作区");
+    std::fs::create_dir_all(&path).map_err(|_| failure("workspace_unavailable"))?;
+    Ok(path)
+}
+
+fn remember_workspace(home: &Path, workspace: &Path) {
+    let path = crate::legacy::data_root(home).join("cli-workspace");
+    if std::fs::create_dir_all(path.parent().unwrap_or(home)).is_ok() {
+        let _ = std::fs::write(path, workspace.to_string_lossy().as_bytes());
+    }
+}
+
+fn pick_cli_folder() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        let output = Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "POSIX path of (choose folder with prompt \"选择要打开的项目文件夹\")",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let path = PathBuf::from(text.trim());
+        path.is_absolute().then_some(path)
+    }
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        let script = "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = '选择要打开的项目文件夹'; $d.ShowNewFolderButton = $true; if ($d.ShowDialog() -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }";
+        let output = Command::new("powershell")
+            .args(["-NoLogo", "-NoProfile", "-Command", script])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let path = PathBuf::from(text.trim());
+        path.is_absolute().then_some(path)
+    }
+    #[cfg(not(any(test, target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+pub(crate) fn select_cli_workspace(home: &Path) -> Result<PathBuf, AdapterFailure> {
+    let remembered = crate::legacy::data_root(home).join("cli-workspace");
+    if let Ok(text) = std::fs::read_to_string(&remembered) {
+        let path = PathBuf::from(text.trim());
+        if acceptable_workspace(&path, home) {
+            return Ok(path);
+        }
+    }
+    if let Some(picked) = pick_cli_folder() {
+        if acceptable_workspace(&picked, home) {
+            remember_workspace(home, &picked);
+            return Ok(picked);
+        }
+    }
+    let fallback = default_cli_workspace(home)?;
+    remember_workspace(home, &fallback);
+    Ok(fallback)
+}
+
+fn build_plan(
+    platform: Platform,
+    installation: &ResolvedInstallation,
+    tool_id: &str,
+    workspace: &Path,
+    windows_root: Option<&Path>,
+) -> Result<LaunchPlan, AdapterFailure> {
+    // `codex_cli`：Codex 接入记录仍是 `codex_desktop`，装的是命令行版时在终端里开。
+    if !matches!(
+        tool_id,
+        "claude_code" | "pi" | "opencode" | "cline" | "hermes" | "openclaw" | "codex_cli"
+    ) {
+        return Err(failure("invalid_launch_target"));
+    }
+    let executable = path_text(&installation.path, platform)?;
+    let workspace = path_text(workspace, platform)?;
+    let attempts = launch_attempts(tool_id);
+    match platform {
+        Platform::MacOs => {
+            let runtime_directories = common::cli_runtime_directories(&installation.path)
+                .iter()
+                .map(|path| path_text(path, platform))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LaunchPlan {
+                // A normal LaunchServices document-open, not AppleScript
+                // automation. Hardened candidates need no AppleEvents grant.
+                program: "/usr/bin/open".into(),
+                args: vec!["-b".into(), "com.apple.Terminal".into()],
+                new_console: false,
+                mac_command: Some(mac_shell_command(
+                    &executable,
+                    &workspace,
+                    &runtime_directories,
+                    attempts,
+                )),
+                working_directory: workspace,
+            })
+        }
+        Platform::Windows => {
+            let root = path_text(
+                windows_root.ok_or_else(|| failure("terminal_unavailable"))?,
+                platform,
+            )?;
+            let root = root.trim_end_matches(['\\', '/']);
+            let suffix = executable
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let invocation = match suffix.as_str() {
+                // Windows PowerShell 5.1 没有 `||`，用退出码接下一种。
+                "exe" => attempts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arguments)| {
+                        let call = with_arguments(
+                            format!("& {}", powershell_literal(&executable)),
+                            arguments,
+                        );
+                        if index == 0 {
+                            call
+                        } else {
+                            format!("if ($LASTEXITCODE -ne 0) {{ {call} }}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                "cmd" | "bat" => {
+                    // Expand the target through a child-only environment value
+                    // once. Literal %...% inside a path is not recursively
+                    // expanded; /V:OFF also keeps ! literal. ProcessStartInfo
+                    // avoids PowerShell's native argument re-quoting of /C.
+                    // 参数只有上面写死的几个英文词，不含引号和 cmd 的特殊字符。
+                    let command = attempts
+                        .iter()
+                        .map(|arguments| {
+                            with_arguments("\"%YESCHOY_CLI_TARGET%\"".to_owned(), arguments)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    format!("$p = New-Object System.Diagnostics.ProcessStartInfo; $p.FileName = {}; $p.Arguments = '/D /V:OFF /S /C \"{command}\"'; $p.UseShellExecute = $false; $p.WorkingDirectory = {}; $p.EnvironmentVariables['YESCHOY_CLI_TARGET'] = {}; $c = [System.Diagnostics.Process]::Start($p); $c.WaitForExit()", powershell_literal(&format!("{root}\\System32\\cmd.exe")), powershell_literal(&workspace), powershell_literal(&executable))
+                }
+                _ => return Err(failure("invalid_launch_target")),
+            };
+            let script = format!(
+                "$ErrorActionPreference = 'Stop'; Remove-Item Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue; Set-Location -LiteralPath {}; {invocation}",
+                powershell_literal(&workspace)
+            );
+            let utf16 = script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            Ok(LaunchPlan {
+                program: format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+                args: vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NoExit".into(),
+                    "-EncodedCommand".into(),
+                    STANDARD.encode(utf16),
+                ],
+                new_console: true,
+                working_directory: workspace,
+                mac_command: None,
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TemporaryCommandFile {
+    directory: std::path::PathBuf,
+    path: std::path::PathBuf,
+    handed_off: bool,
+}
+
+#[cfg(unix)]
+impl TemporaryCommandFile {
+    fn new(command: &str) -> Result<Self, AdapterFailure> {
+        use std::{
+            io::Write,
+            os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+        };
+
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .map_err(|_| failure("terminal_launch_failed"))?;
+        for _ in 0..16 {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).map_err(|_| failure("terminal_launch_failed"))?;
+            let name = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let directory = base.join(format!("yeschoy-terminal-{name}"));
+            match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(failure("terminal_launch_failed")),
+            }
+            let staged = Self {
+                path: directory.join("launch.command"),
+                directory,
+                handed_off: false,
+            };
+            let path = path_text(&staged.path, Platform::MacOs)?;
+            let directory = path_text(&staged.directory, Platform::MacOs)?;
+            // The open request is asynchronous. Unlink only after Terminal has
+            // actually started reading this script, before replacing it by the
+            // CLI. Each cleanup target is an exact file/directory we created.
+            let script = format!(
+                "#!/bin/sh\n/bin/rm -f -- {} || exit 1\n/bin/rmdir -- {} || exit 1\n{command}\n",
+                quoted_shell(&path),
+                quoted_shell(&directory)
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&staged.path)
+                .map_err(|_| failure("terminal_launch_failed"))?;
+            file.write_all(script.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|_| failure("terminal_launch_failed"))?;
+            return Ok(staged);
+        }
+        Err(failure("terminal_launch_failed"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TemporaryCommandFile {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            let _ = std::fs::remove_file(&self.path);
+            // Never recursively remove a directory, even this private one.
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+}
+
+fn launch_with(
+    plan: &LaunchPlan,
+    executor: impl FnOnce(&LaunchPlan) -> Result<(), AdapterFailure>,
+) -> Result<(), AdapterFailure> {
+    if let Some(command) = &plan.mac_command {
+        #[cfg(unix)]
+        {
+            let mut staged = TemporaryCommandFile::new(command)?;
+            let mut resolved = plan.clone();
+            resolved
+                .args
+                .push(path_text(&staged.path, Platform::MacOs)?);
+            resolved.mac_command = None;
+            let result = executor(&resolved);
+            staged.handed_off = result.is_ok();
+            return result;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            return Err(AdapterFailure::UnsupportedProfile);
+        }
+    }
+    executor(plan)
+}
+
+fn execute(plan: &LaunchPlan) -> Result<(), AdapterFailure> {
+    let mut command = Command::new(&plan.program);
+    command
+        .args(&plan.args)
+        .current_dir(&plan.working_directory);
+    if !plan.new_console {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    #[cfg(target_os = "windows")]
+    if plan.new_console {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE, no elevation.
+    }
+    let mut child = command.spawn().map_err(|error| {
+        failure(if error.kind() == std::io::ErrorKind::NotFound {
+            "terminal_unavailable"
+        } else {
+            "terminal_launch_failed"
+        })
+    })?;
+    if plan.new_console {
+        return Ok(());
+    } // Windows console intentionally stays open.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(failure("terminal_launch_failed"))
+                }
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(failure("terminal_launch_failed"));
+            }
+        }
+    }
+}
+
+/// Run bounded native terminal handoff away from the async command executor.
+pub(crate) async fn launch_async(
+    installation: &ResolvedInstallation,
+    tool_id: &str,
+    home: &Path,
+) -> Result<(), AdapterFailure> {
+    let installation = installation.clone();
+    let tool_id = tool_id.to_owned();
+    let home = home.to_owned();
+    tauri::async_runtime::spawn_blocking(move || launch(&installation, &tool_id, &home))
+        .await
+        .map_err(|_| failure("terminal_launch_failed"))?
+}
+
+pub(crate) fn launch(
+    installation: &ResolvedInstallation,
+    tool_id: &str,
+    home: &Path,
+) -> Result<(), AdapterFailure> {
+    #[cfg(target_os = "macos")]
+    let platform = Platform::MacOs;
+    #[cfg(target_os = "windows")]
+    let platform = Platform::Windows;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (installation, tool_id, home);
+        return Err(AdapterFailure::UnsupportedProfile);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+        let workspace = select_cli_workspace(home)?;
+        if !workspace.is_dir() {
+            return Err(failure("workspace_unavailable"));
+        }
+        let plan = build_plan(
+            platform,
+            installation,
+            tool_id,
+            &workspace,
+            system_root.as_deref(),
+        )?;
+        if !installation.path.is_file() || !workspace.is_dir() {
+            return Err(failure("launch_target_missing"));
+        }
+        launch_with(&plan, execute)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_async_handoff_preserves_validation_failure_without_launching() {
+        let result = launch_async(
+            &ResolvedInstallation {
+                path: "/synthetic/nonexistent/pi".into(),
+            },
+            "not-a-supported-tool",
+            Path::new("/synthetic"),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn activation_and_open_button_share_terminal_handoff() {
+        let activation = include_str!("../tool_activation.rs");
+        let opener = activation
+            .split("async fn open_configured_adapter(")
+            .nth(1)
+            .unwrap()
+            .split("struct DesktopReloadGuard")
+            .next()
+            .unwrap();
+        assert!(opener.contains("terminal_launch::launch_async("));
+        assert!(!opener.contains("\"claude_code\" | \"pi\" => Ok(())"));
+        assert!(include_str!("../open_connection.rs").contains("terminal_launch::launch_async("));
+    }
+
+    #[test]
+    fn terminal_plans_are_closed_and_propagate_injected_launcher_failure() {
+        let installation = ResolvedInstallation {
+            path: "/native/含 空格 O'Brian;$()&`/pi".into(),
+        };
+        let plan = build_plan(
+            Platform::MacOs,
+            &installation,
+            "pi",
+            Path::new("/native/我的项目"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.program, "/usr/bin/open");
+        assert_eq!(plan.args, ["-b", "com.apple.Terminal"]);
+        assert_eq!(
+            plan.mac_command.as_deref(),
+            Some(
+                mac_shell_command(
+                    installation.path.to_str().unwrap(),
+                    "/native/我的项目",
+                    &[],
+                    &[&[]],
+                )
+                .as_str()
+            )
+        );
+        // Inject a non-Mac plan so this pure dispatch test also runs on Windows.
+        let dispatch = build_plan(
+            Platform::Windows,
+            &ResolvedInstallation {
+                path: r"C:\native\pi.exe".into(),
+            },
+            "pi",
+            Path::new(r"C:\native"),
+            Some(Path::new(r"C:\Windows")),
+        )
+        .unwrap();
+        let mut called = false;
+        assert!(matches!(
+            launch_with(&dispatch, |received| {
+                called = true;
+                assert_eq!(received, &dispatch);
+                Err(failure("terminal_launch_failed"))
+            }),
+            Err(AdapterFailure::LaunchError("terminal_launch_failed"))
+        ));
+        assert!(called);
+        for tool in ["dsh_web", "codex_desktop", "pi;id", "../../pi"] {
+            assert!(build_plan(
+                Platform::MacOs,
+                &installation,
+                tool,
+                Path::new("/native"),
+                None
+            )
+            .is_err());
+        }
+        for path in ["relative/pi", "/native/pi\ncommand"] {
+            assert!(build_plan(
+                Platform::MacOs,
+                &ResolvedInstallation { path: path.into() },
+                "pi",
+                Path::new("/native"),
+                None
+            )
+            .is_err());
+        }
+    }
+
+    fn windows_script(plan: &LaunchPlan) -> String {
+        let bytes = STANDARD.decode(&plan.args[4]).unwrap();
+        String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn openclaw_opens_its_local_chat_and_falls_back_to_the_gateway_one() {
+        let mac = build_plan(
+            Platform::MacOs,
+            &ResolvedInstallation {
+                path: "/native/bin/openclaw".into(),
+            },
+            "openclaw",
+            Path::new("/native/work"),
+            None,
+        )
+        .unwrap();
+        assert!(mac
+            .mac_command
+            .as_deref()
+            .unwrap()
+            .ends_with("\n'/native/bin/openclaw' tui --local || exec '/native/bin/openclaw' tui"));
+
+        let cmd = windows_script(
+            &build_plan(
+                Platform::Windows,
+                &ResolvedInstallation {
+                    path: r"C:\native\openclaw.cmd".into(),
+                },
+                "openclaw",
+                Path::new(r"C:\native"),
+                Some(Path::new(r"C:\Windows")),
+            )
+            .unwrap(),
+        );
+        assert!(cmd.contains(
+            "/D /V:OFF /S /C \"\"%YESCHOY_CLI_TARGET%\" tui --local || \"%YESCHOY_CLI_TARGET%\" tui\"'"
+        ));
+
+        let exe = windows_script(
+            &build_plan(
+                Platform::Windows,
+                &ResolvedInstallation {
+                    path: r"C:\native\openclaw.exe".into(),
+                },
+                "openclaw",
+                Path::new(r"C:\native"),
+                Some(Path::new(r"C:\Windows")),
+            )
+            .unwrap(),
+        );
+        let target = powershell_literal(r"C:\native\openclaw.exe");
+        assert!(exe.ends_with(&format!(
+            "& {target} tui --local; if ($LASTEXITCODE -ne 0) {{ & {target} tui }}"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openclaw_fallback_runs_only_when_the_local_chat_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            super::super::common::temporary_working_directory("terminal-openclaw").unwrap();
+        let executable = directory.join("openclaw");
+        // 仿 OpenClaw：标记文件在就当 Gateway 开着，`--local` 拒绝并以 1 退出。
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n[ \"$*\" = 'tui --local' ] && [ -e \"$0.gateway\" ] && exit 1\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let script = mac_shell_command(
+            executable.to_str().unwrap(),
+            directory.to_str().unwrap(),
+            &[],
+            launch_attempts("openclaw"),
+        );
+        let calls = directory.join("openclaw.calls");
+        let run = || {
+            let _ = std::fs::remove_file(&calls);
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::fs::read_to_string(&calls).unwrap()
+        };
+        assert_eq!(run(), "tui --local\n");
+        std::fs::write(directory.join("openclaw.gateway"), b"").unwrap();
+        assert_eq!(run(), "tui --local\ntui\n");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn windows_terminal_plan_preserves_literal_unicode_and_shell_metacharacters() {
+        let target = r"C:\Users\用户 O'Brian ‘smart’ & %NAME% ! $() `;\pi.cmd";
+        let plan = build_plan(
+            Platform::Windows,
+            &ResolvedInstallation {
+                path: target.into(),
+            },
+            "pi",
+            Path::new(r"C:\Users\用户 O'Brian"),
+            Some(Path::new(r"C:\Windows")),
+        )
+        .unwrap();
+        assert!(plan.new_console);
+        assert!(plan.mac_command.is_none());
+        assert_eq!(
+            plan.program,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+        assert_eq!(
+            &plan.args[..4],
+            &["-NoLogo", "-NoProfile", "-NoExit", "-EncodedCommand"]
+        );
+        let bytes = STANDARD.decode(&plan.args[4]).unwrap();
+        let text = String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(text.contains(&powershell_literal(target)));
+        assert!(!text.contains(target));
+        assert!(text.contains("/D /V:OFF /S /C \"\"%YESCHOY_CLI_TARGET%\"\""));
+        assert!(text.contains(
+            "Remove-Item Env:ANTHROPIC_BASE_URL,Env:ANTHROPIC_AUTH_TOKEN,Env:ANTHROPIC_API_KEY"
+        ));
+        assert!(text.contains(&format!(
+            "Set-Location -LiteralPath {}",
+            powershell_literal(r"C:\Users\用户 O'Brian")
+        )));
+        assert!(text.contains(&format!(
+            "$p.WorkingDirectory = {}",
+            powershell_literal(r"C:\Users\用户 O'Brian")
+        )));
+        for forbidden in [
+            "ExecutionPolicy",
+            "RunAs",
+            "credential-helper",
+            "https://",
+            "apiKey",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+        for invalid in [r"C:pi.exe", r"\\.\device\pi.exe", r"C:\Users\pi.ps1"] {
+            assert!(build_plan(
+                Platform::Windows,
+                &ResolvedInstallation {
+                    path: invalid.into()
+                },
+                "pi",
+                Path::new(r"C:\Users\example"),
+                Some(Path::new(r"C:\Windows"))
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mac_shell_command_executes_only_the_literal_fixture_path_in_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            super::super::common::temporary_working_directory("terminal-escaping").unwrap();
+        let home = directory.join("项目 O'Brian;$()&`");
+        std::fs::create_dir(&home).unwrap();
+        let executable = home.join("fake cli ';&$()`");
+        std::fs::write(&executable, b"#!/bin/sh\nprintf 'fixture-only\\n'\npwd\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plan = build_plan(
+            Platform::MacOs,
+            &ResolvedInstallation { path: executable },
+            "pi",
+            &home,
+            None,
+        )
+        .unwrap();
+        let mut command_file = None;
+        launch_with(&plan, |received| {
+            assert_eq!(received.program, "/usr/bin/open");
+            assert_eq!(&received.args[..2], &["-b", "com.apple.Terminal"]);
+            assert_eq!(received.args.len(), 3);
+            command_file = Some(std::path::PathBuf::from(&received.args[2]));
+            // Simulate accepted LaunchServices handoff without opening Terminal.
+            Ok(())
+        })
+        .unwrap();
+        let command_file = command_file.unwrap();
+        let command_directory = command_file.parent().unwrap().to_owned();
+        assert!(
+            command_file.is_file(),
+            "must not delete before Terminal reads it"
+        );
+        assert_eq!(
+            std::fs::metadata(&command_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&command_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let script = std::fs::read_to_string(&command_file).unwrap();
+        assert!(script.contains("export PATH"));
+        assert!(script.contains("unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY"));
+        assert!(script.contains(&quoted_shell(home.to_str().unwrap())));
+        for forbidden in ["osascript", "credential-helper", "https://", "apiKey"] {
+            assert!(!script.contains(forbidden));
+        }
+        let result = Command::new("/bin/sh").arg(&command_file).output().unwrap();
+        assert!(result.status.success());
+        let output = String::from_utf8(result.stdout).unwrap();
+        assert!(output.starts_with("fixture-only\n"));
+        // macOS /var may resolve to /private/var; compare filesystem identities.
+        let printed_home = Path::new(output.lines().nth(1).unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(printed_home, home.canonicalize().unwrap());
+        assert!(
+            !command_file.exists(),
+            "script must unlink itself before exec"
+        );
+        assert!(
+            !command_directory.exists(),
+            "script must remove its own empty directory"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mac_command_launch_failure_cleans_private_files_after_injected_process_exit() {
+        let launcher = super::super::common::test_support::Script::new("exit 17");
+        let plan = build_plan(
+            Platform::MacOs,
+            &launcher.installation(),
+            "pi",
+            launcher.path.parent().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut staged = None;
+        let result = launch_with(&plan, |received| {
+            let path = std::path::PathBuf::from(&received.args[2]);
+            assert!(path.is_file());
+            staged = Some(path);
+            let mut fixture = received.clone();
+            fixture.program = launcher.path.to_str().unwrap().into();
+            execute(&fixture)
+        });
+        assert!(matches!(
+            result,
+            Err(AdapterFailure::LaunchError("terminal_launch_failed"))
+        ));
+        let staged = staged.unwrap();
+        assert!(!staged.exists());
+        assert!(!staged.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn cli_workspace_never_uses_the_user_home_directory() {
+        let home = super::super::common::temporary_working_directory("cli-workspace").unwrap();
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let chosen = select_cli_workspace(&home).unwrap();
+        assert_ne!(chosen, home);
+        assert!(chosen.ends_with("YesChoy 工作区"));
+        assert!(chosen.is_dir());
+        // “开饭”测试版建过的文件夹：接着用它，不另建一个。
+        let old = home.join("Documents").join("开饭工作区");
+        std::fs::create_dir_all(&old).unwrap();
+        assert_eq!(default_cli_workspace(&home).unwrap(), old);
+        // 发布过的旧版建的是“野菜工作区”；两个都在时用它。
+        let older = home.join("Documents").join("野菜工作区");
+        std::fs::create_dir_all(&older).unwrap();
+        assert_eq!(default_cli_workspace(&home).unwrap(), older);
+        std::fs::write(
+            home.join(".yeschoy").join("cli-workspace"),
+            home.as_os_str().as_encoded_bytes(),
+        )
+        .ok();
+        let again = select_cli_workspace(&home).unwrap();
+        assert_ne!(again, home);
+        let project = home.join("Documents").join("my-app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home.join(".yeschoy").join("cli-workspace"),
+            project.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(select_cli_workspace(&home).unwrap(), project);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}

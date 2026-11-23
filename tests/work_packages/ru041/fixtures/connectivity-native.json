@@ -1,0 +1,215 @@
+{
+  "reachable": {
+    "requestId": "diag-fixture-reachable",
+    "schemaVersion": 2,
+    "startedAtEpochMs": 1788607800000,
+    "completedAtEpochMs": 1788607800030,
+    "lines": [
+      {
+        "lineId": "mainland_optimized",
+        "displayName": "大陆优化",
+        "rootUrl": "https://yeschoy.com",
+        "host": "yeschoy.com",
+        "port": 443,
+        "layers": [
+          {
+            "layer": "dns",
+            "status": "passed",
+            "latencyMs": 11,
+            "reasonCode": "dns_resolved"
+          },
+          {
+            "layer": "tcp",
+            "status": "passed",
+            "latencyMs": 12,
+            "reasonCode": "tcp443_reachable"
+          },
+          {
+            "layer": "tls",
+            "status": "passed",
+            "latencyMs": 13,
+            "reasonCode": "tls_handshake_verified"
+          },
+          {
+            "layer": "api_key",
+            "status": "passed",
+            "latencyMs": 14,
+            "reasonCode": "session_token_valid"
+          }
+        ]
+      },
+      {
+        "lineId": "global_accelerated",
+        "displayName": "全球加速",
+        "rootUrl": "https://api.yeschoy.com",
+        "host": "api.yeschoy.com",
+        "port": 443,
+        "layers": [
+          {
+            "layer": "dns",
+            "status": "passed",
+            "latencyMs": 21,
+            "reasonCode": "dns_resolved"
+          },
+          {
+            "layer": "tcp",
+            "status": "passed",
+            "latencyMs": 22,
+            "reasonCode": "tcp443_reachable"
+          },
+          {
+            "layer": "tls",
+            "status": "passed",
+            "latencyMs": 23,
+            "reasonCode": "tls_handshake_verified"
+          },
+          {
+            "layer": "api_key",
+            "status": "passed",
+            "latencyMs": 24,
+            "reasonCode": "session_token_valid"
+          }
+        ]
+      }
+    ]
+  },
+  "mixed": {
+    "requestId": "diag-fixture-mixed",
+    "schemaVersion": 2,
+    "startedAtEpochMs": 1788607800000,
+    "completedAtEpochMs": 1788607800030,
+    "lines": [
+      {
+        "lineId": "mainland_optimized",
+        "displayName": "大陆优化",
+        "rootUrl": "https://yeschoy.com",
+        "host": "yeschoy.com",
+        "port": 443,
+        "layers": [
+          {
+            "layer": "dns",
+            "status": "passed",
+            "latencyMs": 11,
+            "reasonCode": "dns_resolved"
+          },
+          {
+            "layer": "tcp",
+            "status": "passed",
+            "latencyMs": 12,
+            "reasonCode": "tcp443_reachable"
+          },
+          {
+            "layer": "tls",
+            "status": "passed",
+            "latencyMs": 13,
+            "reasonCode": "tls_handshake_verified"
+          },
+          {
+            "layer": "api_key",
+            "status": "skipped",
+            "reasonCode": "skipped_no_saved_session"
+          }
+        ]
+      },
+      {
+        "lineId": "global_accelerated",
+        "displayName": "全球加速",
+        "rootUrl": "https://api.yeschoy.com",
+        "host": "api.yeschoy.com",
+        "port": 443,
+        "layers": [
+          {
+            "layer": "dns",
+            "status": "failed",
+            "latencyMs": 11,
+            "reasonCode": "dns_resolution_failed"
+          },
+          {
+            "layer": "tcp",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          },
+          {
+            "layer": "tls",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          },
+          {
+            "layer": "api_key",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          }
+        ]
+      }
+    ]
+  },
+  "failed": {
+    "requestId": "diag-fixture-failed",
+    "schemaVersion": 2,
+    "startedAtEpochMs": 1788607800000,
+    "completedAtEpochMs": 1788607800030,
+    "lines": [
+      {
+        "lineId": "mainland_optimized",
+        "displayName": "大陆优化",
+        "rootUrl": "https://yeschoy.com",
+        "host": "yeschoy.com",
+        "port": 443,
+        "layers": [
+          {
+            "layer": "dns",
+            "status": "passed",
+            "latencyMs": 10,
+            "reasonCode": "dns_resolved"
+          },
+          {
+            "layer": "tcp",
+            "status": "failed",
+            "latencyMs": 11,
+            "reasonCode": "tcp_connection_failed"
+          },
+          {
+            "layer": "tls",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          },
+          {
+            "layer": "api_key",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          }
+        ]
+      },
+      {
+        "lineId": "global_accelerated",
+        "displayName": "全球加速",
+        "rootUrl": "https://api.yeschoy.com",
+        "host": "api.yeschoy.com",
+        "port": 443,
+        "layers": [
+          {
+            "layer": "dns",
+            "status": "failed",
+            "latencyMs": 20,
+            "reasonCode": "dns_lookup_timed_out"
+          },
+          {
+            "layer": "tcp",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          },
+          {
+            "layer": "tls",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          },
+          {
+            "layer": "api_key",
+            "status": "skipped",
+            "reasonCode": "skipped_upstream_failed"
+          }
+        ]
+      }
+    ]
+  }
+}

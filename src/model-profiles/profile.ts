@@ -1,0 +1,237 @@
+import catalog from "./catalog.json";
+
+// Reference metadata is not a model allowlist or a billing-route guarantee.
+let profiles = new Map(catalog.models.map((model) => [model.id, model]));
+// 站点后台填的型号名大小写随人（`DeepSeek-V4.1-Flash-1017`），目录里一律小写。
+let folded = foldCase(profiles);
+
+function foldCase<T>(byId: Map<string, T>): Map<string, T> {
+  return new Map([...byId].map(([id, model]) => [id.toLowerCase(), model]));
+}
+
+function lookup(id: string) {
+  return profiles.get(id) ?? folded.get(id.toLowerCase());
+}
+
+/**
+ * Swap the lookup table for a validated remote catalog revision (M5).
+ * Passing null restores the bundled catalog. Only remoteCatalog.ts calls
+ * this, after its sha256 + schema + freshness checks passed.
+ */
+export function applyModelCatalogOverride(
+  models: typeof catalog.models | null,
+): void {
+  profiles = new Map(
+    (models ?? catalog.models).map((model) => [model.id, model]),
+  );
+  folded = foldCase(profiles);
+}
+
+/**
+ * 中转把推理档位烧进了模型 ID 里：`gemini-3.7-flash-high` 就是
+ * `gemini-3.7-flash` 跑在 `high` 档。目录里收的是基础型号，所以精确查不到的
+ * 时候要把后缀摘掉再查一次，否则这些型号在界面上什么标注都没有。
+ *
+ * 后缀表和适用范围都照抄中转的 `ParseOpenAIReasoningEffortFromModelSuffix`
+ * （`relaykit/relayconvert/reasoning/suffix.go`）：它只对 `gpt-*`、`o<n>*`、
+ * `claude-*`、`gemini-*` 这几族拆后缀。这一条限制不是可有可无的 —— 目录里
+ * `qwen3.8-max` 是一个完整型号名，不在这几族里，所以它的 `-max` 不会被误拆。
+ */
+const EFFORT_SUFFIXES = [
+  "-max",
+  "-xhigh",
+  "-high",
+  "-medium",
+  "-low",
+  "-minimal",
+  "-none",
+] as const;
+
+const EFFORT_SUFFIXED_FAMILIES = /^(?:gpt-[a-z0-9]|o[1-9]|claude-|gemini-)/;
+
+function splitEffortSuffix(
+  id: string,
+): { base: string; effort: string } | null {
+  const suffix = EFFORT_SUFFIXES.find((candidate) =>
+    id.toLowerCase().endsWith(candidate),
+  );
+  if (!suffix) return null;
+  const base = id.slice(0, -suffix.length);
+  // 命名空间前缀保持不透明，只看最后一段是不是这几族 —— 跟中转的
+  // `lastModelPathSegment` 一致。
+  const bare = base.toLowerCase().split("/").at(-1) ?? "";
+  if (!EFFORT_SUFFIXED_FAMILIES.test(bare)) return null;
+  return { base, effort: suffix.slice(1) };
+}
+
+/**
+ * 精确命中优先。只有查不到时才退一步拆后缀，这样将来目录里直接收了某个带
+ * 后缀的完整型号名，它仍然说了算。
+ */
+function resolveProfile(id: string) {
+  const exact = lookup(id);
+  if (exact) return exact;
+  const split = splitEffortSuffix(id);
+  if (!split) return undefined;
+  const base = lookup(split.base);
+  if (!base) return undefined;
+  // ID 已经把档位钉死了，所以这个型号的档位阶梯只有一级，也没有「默认档」
+  // 可言 —— 照搬基础型号的整条阶梯会让人以为还能选。
+  return {
+    ...base,
+    displayName: `${base.displayName} (${split.effort})`,
+    reasoningLevels: [split.effort],
+    defaultReasoning: undefined,
+  };
+}
+
+/**
+ * 目录没有收录时，尽量把 API ID 读成人话：去掉日期尾巴、常见词首字母大写。
+ * 不猜能力，只猜「怎么念」—— 小白认得出 Claude，认不出一长串日期。
+ */
+export function humanizeModelId(id: string): string {
+  if (!id) return id;
+  const bare = id.split("/").at(-1) ?? id;
+  // 短测试夹具（model-a）和用户自定义短名保持原样；只收拾「长得像官网 API」的。
+  const looksTechnical =
+    /-\d{6,8}$/.test(bare) ||
+    /^(?:gpt|claude|sonnet|opus|haiku|deepseek|gemini|glm|kimi|qwen|llama|codex|doubao)[-_]/i.test(
+      bare,
+    );
+  if (!looksTechnical) return id;
+  // 常见：claude-sonnet-4-5-20250929 → 去掉末尾 6～8 位日期
+  const withoutDate = bare.replace(/-\d{6,8}$/, "");
+
+  const spaced = withoutDate
+    // 单个字母紧跟数字的是版本写法（V4.1、R1、K2），不拆开。
+    .replace(/([a-z]{2,})(\d)/gi, "$1 $2")
+    .replace(/(\d)\.(\d)/g, "$1.$2")
+    .replace(/[-_]+/g, " ")
+    .trim();
+  const tokens = spaced.split(/\s+/).filter(Boolean);
+  const pretty = tokens
+    .map((token) => {
+      const lower = token.toLowerCase();
+      const known: Record<string, string> = {
+        gpt: "GPT",
+        claude: "Claude",
+        sonnet: "Sonnet",
+        opus: "Opus",
+        haiku: "Haiku",
+        deepseek: "DeepSeek",
+        gemini: "Gemini",
+        glm: "GLM",
+        kimi: "Kimi",
+        qwen: "Qwen",
+        llama: "Llama",
+        flash: "Flash",
+        pro: "Pro",
+        mini: "Mini",
+        turbo: "Turbo",
+        codex: "Codex",
+      };
+      if (known[lower]) return known[lower];
+      // 4-5 → 4.5（版本号中间的连字符）
+      if (/^\d+$/.test(token)) return token;
+      if (/^\d+\.\d+$/.test(token)) return token;
+      return token.charAt(0).toUpperCase() + token.slice(1);
+    })
+    .join(" ");
+  // 把 "4 5" 收成 "4.5"（Claude 版本习惯）
+  return pretty.replace(/\b(\d+)\s+(\d+)\b/g, "$1.$2");
+}
+
+/** 列表里的短 ID：超长就截掉中间，保留头尾，避免芯片一行爆炸。 */
+export function shortModelId(id: string, max = 28): string {
+  if (!id || id.length <= max) return id;
+  const keep = Math.max(8, Math.floor((max - 1) / 2));
+  return `${id.slice(0, keep)}…${id.slice(-keep)}`;
+}
+
+export function modelDisplayName(id: string): string {
+  return resolveProfile(id)?.displayName ?? humanizeModelId(id);
+}
+
+// Image generation is not a chat/agent model. Do not hide vision-capable chat.
+export function isImageGenerationModel(id: string): boolean {
+  return /^(?:gpt-image(?:-|$)|dall-e(?:-|$))/.test(
+    id.toLowerCase().split("/").at(-1) ?? "",
+  );
+}
+
+export interface ModelCapabilities {
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  input?: readonly string[];
+  reasoningLevels?: readonly string[];
+  defaultReasoning?: string;
+  toolUse?: boolean;
+}
+
+/**
+ * Read-only capability lookup against the reviewed reference catalog.
+ * The catalog is metadata, not an allowlist: unknown models return an empty
+ * object — capabilities are never guessed (PRD 6.5), and missing fields are
+ * simply omitted so callers render no badge instead of "unsupported".
+ */
+export function modelCapabilities(id: string): ModelCapabilities {
+  const model = resolveProfile(id);
+  if (!model) return {};
+  return {
+    ...(model.contextWindow !== undefined
+      ? { contextWindow: model.contextWindow }
+      : {}),
+    ...(model.maxOutputTokens !== undefined
+      ? { maxOutputTokens: model.maxOutputTokens }
+      : {}),
+    ...(model.input !== undefined ? { input: model.input } : {}),
+    ...(model.reasoningLevels !== undefined
+      ? { reasoningLevels: model.reasoningLevels }
+      : {}),
+    ...(model.defaultReasoning !== undefined
+      ? { defaultReasoning: model.defaultReasoning }
+      : {}),
+    ...(model.toolUse !== undefined ? { toolUse: model.toolUse } : {}),
+  };
+}
+
+/**
+ * 目录里有没有这个模型的能力资料。
+ *
+ * 用来挑默认项：账号的模型列表是按字母排的，`models[0]` 就成了默认值，于是
+ * WorkBuddy 一打开默认选中 `codex-auto-review` —— 一个服务端的路由别名
+ * （QA 脚本里早就这么归类了），目录里没有它的任何资料，所以卡片上连一个标注
+ * 都没有。对一个专门服务「不会配置的人」的产品，第一眼看到的就是一个说不出
+ * 是什么的模型。
+ *
+ * 这里不排优劣、不内定偏好，只回答一个事实问题：我们能不能向用户描述它。
+ * 描述不了的不当默认值，但照样能选。
+ */
+export function hasReviewedCapabilities(id: string): boolean {
+  return resolveProfile(id) !== undefined;
+}
+
+export function modelMatchesQuery(id: string, query: string): boolean {
+  const normalized = query.normalize("NFKC").trim().toLowerCase();
+  if (!normalized) return true;
+  // Search tolerates display/API separators, but never rewrites the selected ID
+  // or indexes private upstream descriptions. Keep version dots and namespaces.
+  const compact = (text: string) =>
+    text
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/[\s_\-\u2010-\u2015]+/g, "");
+  const terms = normalized.split(/\s+/).map(compact).filter(Boolean);
+  if (!terms.length) return false;
+  const identities = [compact(id), compact(modelDisplayName(id))];
+  return terms.every((term) => {
+    if (/^\d+(?:\.\d+)*$/.test(term)) {
+      // "GPT 6" must not suggest GPT-5.6 merely because its minor version is 6.
+      const version = new RegExp(
+        `(?:^|[^\\d.])${term.replace(/\./g, "\\.")}(?=$|[^\\d])`,
+      );
+      return identities.some((text) => version.test(text));
+    }
+    return identities.some((text) => text.includes(term));
+  });
+}

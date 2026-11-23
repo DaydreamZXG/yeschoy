@@ -1,0 +1,3981 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    process::Command,
+    sync::{Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use reqwest::{
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    redirect::Policy,
+    Client, Method, StatusCode, Url,
+};
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::account_finance::{
+    account_money, recent_requests_from_pages, recent_savings, usage_log_report, AccountMoney,
+    RecentSavings, UsageLogReport, RECENT_LOGS_PATH, USAGE_LOG_PAGE_SIZE, USAGE_WINDOW_MS,
+};
+use crate::connectivity_core::{request_id_is_valid, CONNECTIVITY_LINES};
+
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 开机检查账户不能拖住界面：整条 inspect（bootstrap→刷新→账户）最多等这么久。
+/// 5 秒够慢网完成一次往返；再长就只是让首页干等。
+const INSPECT_DEADLINE: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const KEYRING_SERVICE: &str = "com.yeschoy.desktop.account";
+const KEYRING_USER: &str = "current-session-v2";
+const AUTHORIZATION_PATH: &str = "/api/desktop/v2/device-authorizations";
+const TOKEN_PATH: &str = "/api/desktop/v2/device-authorizations/token";
+const REFRESH_PATH: &str = "/api/desktop/v2/sessions/refresh";
+const LOGOUT_PATH: &str = "/api/desktop/v2/sessions/current";
+const ACCOUNT_PATH: &str = "/api/user/self";
+const USAGE_PATH: &str = "/api/log/self/stat";
+const MODELS_PATH: &str = "/api/user/models";
+const PRICING_PATH: &str = "/api/pricing";
+const TOOL_KEYS_PATH: &str = "/api/token/";
+const AUTHORIZATION_PAGE_PATH: &str = "/desktop-authorize";
+const CANONICAL_AUTHORIZATION_PAGE_ORIGIN: &str = "https://yeschoy.com";
+const PARTNER_AUTHORIZATION_PAGE_ORIGIN: &str = "https://ai.yeschoy.io";
+const COMPILED_AUTHORIZATION_PAGE_ORIGIN: &str = env!("YESCHOY_AUTHORIZATION_PAGE_ORIGIN");
+
+static HTTP_CLIENT: OnceLock<Result<Client, ()>> = OnceLock::new();
+
+#[path = "account_key_session.rs"]
+pub(crate) mod key_session;
+
+#[derive(Default)]
+pub struct AccountV2State {
+    runtime: Mutex<AccountRuntime>,
+    refresh_guard: tokio::sync::Mutex<()>,
+    poll_guard: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct AccountRuntime {
+    pending: Option<PendingAuthorization>,
+    access: Option<AccessSession>,
+    wallet_url: Option<String>,
+    authorization_epoch: u64,
+    /// What each notice's button does, from the last read. The renderer only
+    /// ever names a notice; the destination never round-trips through it.
+    announcement_actions: BTreeMap<String, NoticeTarget>,
+}
+
+#[derive(Clone)]
+struct PendingAuthorization {
+    line_id: String,
+    device_code: String,
+    user_code: String,
+    expires_at_epoch_ms: u64,
+    poll_after_seconds: u64,
+}
+
+#[derive(Clone)]
+struct AccessSession {
+    access_token: String,
+    access_expires_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredSession {
+    #[serde(default)]
+    line_id: String,
+    refresh_token: String,
+    session_id: String,
+    refresh_expires_at: i64,
+    /// Set only for a pasted-key session (`station_key:` lines): the station
+    /// has no account API we can sign in to, so the key itself is the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountRequest {
+    request_id: String,
+    line_id: String,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummary {
+    available: bool,
+    display_name: String,
+    username: String,
+    balance_quota: String,
+    used_quota: String,
+    request_count: String,
+    quota_per_unit: String,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummary {
+    available: bool,
+    consumed_quota: String,
+    request_rate: String,
+    token_count: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingGroup {
+    pub(crate) id: String,
+    description: String,
+    /// Set only by stations on the neutral contract: the plan's own name and
+    /// prices, already in the station's currency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<neutral::PlanPricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    supported_endpoint_types: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelBilling {
+    groups: Vec<BillingGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_input_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_output_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_usd: Option<f64>,
+    expression: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountModel {
+    id: String,
+    description: String,
+    billing_mode: &'static str,
+    /// `None` means the relay told us nothing, not that the model speaks
+    /// nothing. `/api/pricing` only covers models it has priced; the account's
+    /// own model list carries others (deepseek-v4-flash is one today). Sending
+    /// `[]` for those made the renderer read "declares no endpoint" and grey
+    /// them everywhere with "哪个应用都用不了" -- the worst possible answer
+    /// about a model that works. Absent field, absent knowledge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supported_endpoint_types: Option<Vec<String>>,
+    pricing_available: bool,
+    official_input_cny_per_million: String,
+    official_output_cny_per_million: String,
+    actual_input_cny_per_million: String,
+    actual_output_cny_per_million: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    billing: Option<ModelBilling>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProjection {
+    request_id: String,
+    schema_version: u8,
+    status: &'static str,
+    user_code: String,
+    poll_after_seconds: u64,
+    expires_at_epoch_ms: u64,
+    observed_at_epoch_ms: u64,
+    account: AccountSummary,
+    usage: UsageSummary,
+    models: Vec<AccountModel>,
+    comparison_fx: String,
+    money: AccountMoney,
+    savings: RecentSavings,
+    usage_log: UsageLogReport,
+    reason_code: &'static str,
+}
+
+impl AccountProjection {
+    fn empty(request_id: String, status: &'static str, reason_code: &'static str) -> Self {
+        Self {
+            request_id,
+            schema_version: 6,
+            status,
+            user_code: String::new(),
+            poll_after_seconds: 0,
+            expires_at_epoch_ms: 0,
+            observed_at_epoch_ms: 0,
+            account: AccountSummary::default(),
+            usage: UsageSummary::default(),
+            models: Vec::new(),
+            comparison_fx: String::new(),
+            money: AccountMoney::default(),
+            savings: RecentSavings::default(),
+            usage_log: UsageLogReport::default(),
+            reason_code,
+        }
+    }
+
+    fn pending(
+        request_id: String,
+        pending: &PendingAuthorization,
+        reason_code: &'static str,
+    ) -> Self {
+        let mut projection = Self::empty(request_id, "authorization_pending", reason_code);
+        projection.user_code = pending.user_code.clone();
+        projection.poll_after_seconds = pending.poll_after_seconds;
+        projection.expires_at_epoch_ms = pending.expires_at_epoch_ms;
+        projection
+    }
+
+    pub(crate) fn is_signed_in(&self) -> bool {
+        self.status == "signed_in"
+    }
+
+    pub(crate) fn reason_code(&self) -> &'static str {
+        self.reason_code
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DesktopBootstrap {
+    device_authorization_available: bool,
+    oauth_loopback_pkce_available: bool,
+    origin: String,
+    wallet_url: String,
+    /// Empty until the server advertises it. The announcements view is the
+    /// first feature to ride the now-tolerant bootstrap contract: a client that
+    /// predates the server field simply never shows the entry, and a server that
+    /// predates the client does the same. Neither side has to ship first.
+    announcements_path: String,
+    pub(crate) dialect: StationDialect,
+}
+
+/// Which set of data endpoints a station serves.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StationDialect {
+    /// The original contract: the paths are New API's own and fixed in this file.
+    Legacy,
+    /// `desktop-connect`: the station names its paths and answers in shapes
+    /// made for this client, so any relay software can implement it.
+    Neutral(NeutralPaths),
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub(crate) struct NeutralPaths {
+    pub(crate) account: String,
+    pub(crate) plans: String,
+    pub(crate) keys: String,
+    pub(crate) usage_summary: String,
+    pub(crate) usage_records: String,
+    /// Empty when the station has no client-only prices.
+    pub(crate) app_tokens: String,
+    pub(crate) app_token_header: String,
+}
+
+pub(crate) mod app_token;
+mod neutral;
+
+const NEUTRAL_SERVICE: &str = "desktop-connect";
+const NEUTRAL_CONTRACT_ID: &str = "desktop-connect-v1";
+
+#[derive(Debug, Deserialize)]
+struct NeutralBootstrapData {
+    schema_version: u8,
+    contract_id: String,
+    minimum_client_version: String,
+    #[serde(default)]
+    device_authorization_available: bool,
+    #[serde(default)]
+    oauth_loopback_pkce_available: bool,
+    account_read: bool,
+    usage_read: bool,
+    models_read: bool,
+    pricing_read: bool,
+    tool_keys_manage: bool,
+    session_refresh_path: String,
+    session_logout_path: String,
+    account_path: String,
+    plans_path: String,
+    keys_path: String,
+    usage_summary_path: String,
+    usage_records_path: String,
+    wallet_url: String,
+    #[serde(default)]
+    announcements_path: String,
+    #[serde(default)]
+    app_tokens_path: String,
+    #[serde(default)]
+    app_token_header: String,
+}
+
+/// The header carries a device credential to the station on every forwarded
+/// request, so the station may only name a custom `X-` header: never one that
+/// already means something to HTTP or to the tools behind the local bridge.
+fn app_token_header_is_allowed(raw: &str) -> bool {
+    raw.len() <= 64
+        && raw.len() > 2
+        && raw.as_bytes()[..2].eq_ignore_ascii_case(b"x-")
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !raw.eq_ignore_ascii_case("x-api-key")
+}
+
+fn neutral_bootstrap(data: Value, origin: &str) -> Result<DesktopBootstrap, &'static str> {
+    let data: NeutralBootstrapData = serde_json::from_value(data).map_err(|_| "shape")?;
+    let minimum = Version::parse(&data.minimum_client_version).map_err(|_| "minimum_version")?;
+    let current = Version::parse(CLIENT_VERSION).expect("compiled client version is valid");
+    if data.schema_version != 2 {
+        return Err("schema_version");
+    }
+    if data.contract_id != NEUTRAL_CONTRACT_ID {
+        return Err("contract_id");
+    }
+    if minimum > current {
+        return Err("client_too_old");
+    }
+    if !(data.account_read
+        && data.usage_read
+        && data.models_read
+        && data.pricing_read
+        && data.tool_keys_manage)
+    {
+        return Err("capabilities");
+    }
+    if data.session_refresh_path != REFRESH_PATH || data.session_logout_path != LOGOUT_PATH {
+        return Err("session_paths");
+    }
+    if !neutral_wallet_url_is_allowed(&data.wallet_url, origin) {
+        return Err("wallet_url");
+    }
+    let required = |raw: &str| relative_api_path(raw).ok_or("paths");
+    let app_tokens = relative_api_path(&data.app_tokens_path).unwrap_or_default();
+    let app_token_header =
+        if !app_tokens.is_empty() && app_token_header_is_allowed(&data.app_token_header) {
+            data.app_token_header
+        } else {
+            String::new()
+        };
+    Ok(DesktopBootstrap {
+        device_authorization_available: data.device_authorization_available,
+        oauth_loopback_pkce_available: data.oauth_loopback_pkce_available,
+        origin: origin.to_owned(),
+        wallet_url: data.wallet_url,
+        announcements_path: relative_api_path(&data.announcements_path).unwrap_or_default(),
+        dialect: StationDialect::Neutral(NeutralPaths {
+            account: required(&data.account_path)?,
+            plans: required(&data.plans_path)?,
+            keys: required(&data.keys_path)?,
+            usage_summary: required(&data.usage_summary_path)?,
+            usage_records: required(&data.usage_records_path)?,
+            // Without both halves there is no client-only price to ask for.
+            app_tokens: if app_token_header.is_empty() {
+                String::new()
+            } else {
+                app_tokens
+            },
+            app_token_header,
+        }),
+    })
+}
+
+// Server responses are read tolerantly, the way `DataEnvelope`,
+// `DeviceAuthorization` and `AuthBundle` below already are. These two were the
+// only strict ones, and being strict here meant the contract could never grow:
+// the day the server added any field, every client already installed would fail
+// to parse bootstrap and therefore fail to sign in at all. A rollout that
+// bricks the previous version is not a rollout.
+//
+// Strictness still belongs on renderer input (`AccountRequest`) and on local
+// records (`StoredSession`), where an unrecognised field really is a fault.
+#[derive(Debug, Deserialize)]
+struct BootstrapEnvelope {
+    success: bool,
+    data: BootstrapData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootstrapData {
+    schema_version: u8,
+    service: String,
+    contract_id: String,
+    minimum_client_version: String,
+    device_authorization_available: bool,
+    #[serde(default)]
+    oauth_loopback_pkce_available: bool,
+    account_read: bool,
+    usage_read: bool,
+    models_read: bool,
+    pricing_read: bool,
+    tool_keys_manage: bool,
+    official_usd_cny_rate: f64,
+    authorization_start_path: String,
+    authorization_token_path: String,
+    session_refresh_path: String,
+    session_logout_path: String,
+    account_path: String,
+    usage_summary_path: String,
+    usage_records_path: String,
+    models_path: String,
+    pricing_path: String,
+    tool_keys_path: String,
+    wallet_url: String,
+    /// Optional. `#[serde(default)]` is what lets an older server omit it.
+    #[serde(default)]
+    announcements_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataEnvelope<T> {
+    success: bool,
+    data: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorization {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthBundle {
+    access_token: String,
+    token_type: String,
+    access_expires_at: i64,
+    refresh_token: String,
+    refresh_expires_at: i64,
+    session_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum TransportFailure {
+    Network,
+    TimedOut,
+    InvalidResponse,
+    /// 答的不是 JSON，状态码又是「太忙」「出错了」那一类：多半是网关的出错页，等下再来就好。
+    Unwell,
+    ResponseTooLarge,
+}
+
+struct JsonResponse {
+    status: StatusCode,
+    value: Value,
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn now_epoch_seconds() -> i64 {
+    (now_epoch_ms() / 1000).min(i64::MAX as u64) as i64
+}
+
+fn client() -> Result<&'static Client, ()> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .https_only(true)
+                .redirect(Policy::none())
+                .referer(false)
+                .no_proxy()
+                .timeout(REQUEST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .user_agent(concat!("YesChoyDesktop/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|_| ())
+        })
+        .as_ref()
+        .map_err(|_| ())
+}
+
+fn line_origin(line_id: &str) -> Option<&'static str> {
+    CONNECTIVITY_LINES
+        .iter()
+        .find(|line| line.line_id == line_id)
+        .map(|line| line.root_url)
+}
+
+pub(crate) fn account_request_line_id_is_valid(line_id: &str) -> bool {
+    line_origin(line_id).is_some()
+        || station_connect_origin_from_line_id(line_id).is_some()
+        || key_session::origin_from_line_id(line_id).is_some()
+}
+
+fn persisted_session_line_id(line_id: &str) -> bool {
+    account_request_line_id_is_valid(line_id)
+}
+
+pub(crate) fn account_line_origin(line_id: &str) -> Option<String> {
+    line_origin(line_id)
+        .map(str::to_owned)
+        .or_else(|| station_connect_origin_from_line_id(line_id).map(str::to_owned))
+        .or_else(|| key_session::origin_from_line_id(line_id).map(str::to_owned))
+}
+
+fn request_is_valid(request: &AccountRequest) -> bool {
+    request_id_is_valid(&request.request_id) && account_request_line_id_is_valid(&request.line_id)
+}
+
+/// After station connect installs credentials, project the same signed-in state
+/// as a successful device-code poll (preview / activation entry point).
+pub(crate) async fn account_project_line_after_connect(
+    state: &AccountV2State,
+    line_id: &str,
+) -> Result<AccountProjection, AccountProjectionFailure> {
+    if !account_request_line_id_is_valid(line_id) {
+        return Err(AccountProjectionFailure::InvalidRequest);
+    }
+    let request = AccountRequest {
+        request_id: format!("station-connect-{}", now_epoch_ms()),
+        line_id: line_id.to_owned(),
+    };
+    inspect_inner(state, &request).await
+}
+
+async fn read_body(mut response: reqwest::Response) -> Result<JsonResponse, TransportFailure> {
+    let status = response.status();
+    let json_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        });
+    if !json_type {
+        return Err(not_json(status.as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(TransportFailure::ResponseTooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(TransportFailure::ResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value = serde_json::from_slice(&bytes).map_err(|_| TransportFailure::InvalidResponse)?;
+    Ok(JsonResponse { status, value })
+}
+
+fn not_json(status: u16) -> TransportFailure {
+    if passing_trouble(status) {
+        TransportFailure::Unwell
+    } else {
+        TransportFailure::InvalidResponse
+    }
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> TransportFailure {
+    if error.is_timeout() {
+        TransportFailure::TimedOut
+    } else {
+        TransportFailure::Network
+    }
+}
+
+async fn send_json(
+    method: Method,
+    url: &str,
+    access_token: Option<&str>,
+    body: Option<Value>,
+) -> Result<JsonResponse, TransportFailure> {
+    let mut request = client()
+        .map_err(|_| TransportFailure::Network)?
+        .request(method, url)
+        .header(ACCEPT, "application/json");
+    if let Some(token) = access_token {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(body) = body {
+        request = request
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+    }
+    let response = request.send().await.map_err(map_reqwest_error)?;
+    read_body(response).await
+}
+
+async fn fetch_bootstrap(line_id: &str) -> Result<DesktopBootstrap, AccountProjectionFailure> {
+    let permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| AccountProjectionFailure::BackendUnavailable)?;
+    permit
+        .cancel_safe(fetch_bootstrap_read(line_id))
+        .await
+        .map_err(|_| AccountProjectionFailure::BackendUnavailable)?
+}
+
+async fn fetch_bootstrap_read(line_id: &str) -> Result<DesktopBootstrap, AccountProjectionFailure> {
+    let origin = account_line_origin(line_id).ok_or(AccountProjectionFailure::InvalidRequest)?;
+    let response = send_json(
+        Method::GET,
+        &format!("{origin}/api/desktop/v2/bootstrap"),
+        None,
+        None,
+    )
+    .await
+    .map_err(AccountProjectionFailure::Transport)?;
+    if !response.status.is_success() {
+        return Err(AccountProjectionFailure::BackendUnavailable);
+    }
+    // A station speaking the neutral contract says so by name; everything
+    // else is read as the original contract, exactly as before.
+    if response.value.get("success").and_then(Value::as_bool) == Some(true)
+        && response
+            .value
+            .get("data")
+            .and_then(|data| data.get("service"))
+            .and_then(Value::as_str)
+            == Some(NEUTRAL_SERVICE)
+    {
+        let data = response.value.get("data").cloned().unwrap_or(Value::Null);
+        return neutral_bootstrap(data, &origin)
+            .inspect(remember_dialect)
+            .map_err(|reason| {
+                log::warn!("account stage=bootstrap_rejected dialect=neutral reason={reason}");
+                AccountProjectionFailure::IncompatibleServer
+            });
+    }
+    let envelope: BootstrapEnvelope = serde_json::from_value(response.value)
+        .map_err(|_| AccountProjectionFailure::IncompatibleServer)?;
+    let data = envelope.data;
+    let minimum = Version::parse(&data.minimum_client_version)
+        .map_err(|_| AccountProjectionFailure::IncompatibleServer)?;
+    let current = Version::parse(CLIENT_VERSION).expect("compiled client version is valid");
+    let paths_match = data.authorization_start_path == AUTHORIZATION_PATH
+        && data.authorization_token_path == TOKEN_PATH
+        && data.session_refresh_path == REFRESH_PATH
+        && data.session_logout_path == LOGOUT_PATH
+        && data.account_path == ACCOUNT_PATH
+        && data.usage_summary_path == USAGE_PATH
+        && data.usage_records_path == "/api/log/self"
+        && data.models_path == MODELS_PATH
+        && data.pricing_path == PRICING_PATH
+        && data.tool_keys_path == TOOL_KEYS_PATH;
+    // Every one of these rejections reaches the user as the same
+    // "incompatible server" banner. Naming the failed clause in the log is the
+    // difference between a one-line server fix and an unreproducible report.
+    let rejection = if !envelope.success {
+        Some("envelope")
+    } else if data.schema_version != 2 {
+        Some("schema_version")
+    } else if data.service != "yeschoy-desktop" {
+        Some("service")
+    } else if data.contract_id != "desktop-integration-v2" {
+        Some("contract_id")
+    } else if minimum > current {
+        Some("client_too_old")
+    } else if !(data.account_read
+        && data.usage_read
+        && data.models_read
+        && data.pricing_read
+        && data.tool_keys_manage)
+    {
+        Some("capabilities")
+    } else if !data.official_usd_cny_rate.is_finite() || data.official_usd_cny_rate <= 0.0 {
+        Some("fx_rate")
+    } else if !paths_match {
+        Some("paths")
+    } else if !wallet_url_is_allowed(&data.wallet_url, &origin) {
+        Some("wallet_url")
+    } else {
+        None
+    };
+    if let Some(reason) = rejection {
+        log::warn!("account stage=bootstrap_rejected reason={reason}");
+        return Err(AccountProjectionFailure::IncompatibleServer);
+    }
+    let accepted = DesktopBootstrap {
+        device_authorization_available: data.device_authorization_available,
+        oauth_loopback_pkce_available: data.oauth_loopback_pkce_available,
+        origin: origin.to_owned(),
+        wallet_url: data.wallet_url,
+        // A path we would fetch from the relay origin, so it has to be a
+        // relative path and nothing else. Anything absolute or scheme-bearing
+        // is dropped rather than rejected: a malformed optional field must not
+        // cost the user their sign-in.
+        announcements_path: relative_api_path(&data.announcements_path).unwrap_or_default(),
+        dialect: StationDialect::Legacy,
+    };
+    remember_dialect(&accepted);
+    Ok(accepted)
+}
+
+/// Accept only a same-origin relative API path such as `/api/desktop/v2/notices`.
+///
+/// The value decides where the client fetches from with the session token
+/// attached, so a server that returned `https://elsewhere.example/...` — or was
+/// made to — must not be able to redirect that fetch off-origin.
+fn relative_api_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !trimmed.starts_with('/')
+        || trimmed.starts_with("//")
+        || trimmed.len() > 256
+        || trimmed.contains("..")
+        || trimmed
+            .bytes()
+            .any(|byte| !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn wallet_url_is_allowed(raw: &str, api_origin: &str) -> bool {
+    wallet_url_is_allowed_official(raw) || wallet_url_on_station_origin(raw, api_origin)
+}
+
+/// The neutral contract leaves the top-up page's path to the station; it only
+/// has to be a page on the station's own host.
+fn neutral_wallet_url_is_allowed(raw: &str, api_origin: &str) -> bool {
+    page_url_on_station_origin(raw, api_origin, "/")
+}
+
+/// The check a station's top-up page passed when its bootstrap was accepted,
+/// made again before the page is opened.
+fn wallet_page_is_allowed(dialect: &StationDialect, raw: &str, api_origin: &str) -> bool {
+    match dialect {
+        StationDialect::Legacy => wallet_url_is_allowed(raw, api_origin),
+        StationDialect::Neutral(_) => neutral_wallet_url_is_allowed(raw, api_origin),
+    }
+}
+
+fn wallet_url_is_allowed_official(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("yeschoy.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().starts_with("/wallet")
+}
+
+/// Third-party stations connected via deep link use their own origin for wallet.
+fn wallet_url_on_station_origin(raw: &str, api_origin: &str) -> bool {
+    page_url_on_station_origin(raw, api_origin, "/wallet")
+}
+
+/// A page on the station's own host, whose path starts with `path_prefix`.
+fn page_url_on_station_origin(raw: &str, api_origin: &str, path_prefix: &str) -> bool {
+    let Ok(station) = Url::parse(api_origin) else {
+        return false;
+    };
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    let station_host = station.host_str().unwrap_or_default();
+    let host = url.host_str().unwrap_or_default();
+    url.scheme() == "https"
+        && !station_host.is_empty()
+        && host == station_host
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().starts_with(path_prefix)
+}
+
+#[cfg(test)]
+fn authorization_url_is_allowed(raw: &str, user_code: &str) -> bool {
+    authorization_url_is_allowed_for(raw, user_code, CANONICAL_AUTHORIZATION_PAGE_ORIGIN)
+}
+
+/// 授权页必须和 `page_origin` 完全同源。`page_origin` 由
+/// `authorization_page_origin_for_line` 决定：内置线路用编译期来源，
+/// 第三方站点用它自己的来源 —— 且只在用户确认信任过之后。
+fn authorization_url_is_allowed_for(raw: &str, user_code: &str, page_origin: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    let Ok(page) = Url::parse(page_origin) else {
+        return false;
+    };
+    let query = url.query_pairs().collect::<Vec<_>>();
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.host_str() == page.host_str()
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == AUTHORIZATION_PAGE_PATH
+        && url.fragment().is_none()
+        && query.len() == 1
+        && query[0].0 == "user_code"
+        && query[0].1 == user_code
+}
+
+/// 设备码授权页的来源。第三方站点不再被编译期白名单拒绝，
+/// 但必须是用户在桌面助手里确认信任过的来源。
+fn authorization_page_origin_for_line(line_id: &str) -> Option<String> {
+    match station_connect_origin_from_line_id(line_id) {
+        Some(origin) if crate::station_trust::is_trusted(origin) => {
+            crate::station_connect::connect_origin_is_acceptable(origin)
+        }
+        Some(_) => None,
+        None => Some(COMPILED_AUTHORIZATION_PAGE_ORIGIN.to_owned()),
+    }
+}
+
+fn browser_authorization_url_for_line(line_id: &str, user_code: &str) -> Option<String> {
+    let origin = authorization_page_origin_for_line(line_id)?;
+    if station_connect_origin_from_line_id(line_id).is_none() {
+        return browser_authorization_url_for_origin(&origin, user_code);
+    }
+    if !user_code_is_valid(user_code) {
+        return None;
+    }
+    let mut url = Url::parse(&format!("{origin}{AUTHORIZATION_PAGE_PATH}")).ok()?;
+    url.query_pairs_mut().append_pair("user_code", user_code);
+    Some(url.into())
+}
+
+fn authorization_page_origin_is_allowed(raw: &str) -> bool {
+    if !matches!(
+        raw,
+        CANONICAL_AUTHORIZATION_PAGE_ORIGIN | PARTNER_AUTHORIZATION_PAGE_ORIGIN
+    ) {
+        return false;
+    }
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && matches!(url.host_str(), Some("yeschoy.com" | "ai.yeschoy.io"))
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn browser_authorization_url_for_origin(origin: &str, user_code: &str) -> Option<String> {
+    if !authorization_page_origin_is_allowed(origin) || !user_code_is_valid(user_code) {
+        return None;
+    }
+    let mut url = Url::parse(&format!("{origin}{AUTHORIZATION_PAGE_PATH}")).ok()?;
+    url.query_pairs_mut().append_pair("user_code", user_code);
+    Some(url.into())
+}
+
+#[cfg(test)]
+fn browser_authorization_url(user_code: &str) -> Option<String> {
+    browser_authorization_url_for_origin(COMPILED_AUTHORIZATION_PAGE_ORIGIN, user_code)
+}
+
+fn user_code_is_valid(value: &str) -> bool {
+    value.len() == 9
+        && value.as_bytes()[4] == b'-'
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_system_browser(url: &str) -> Result<(), ()> {
+    Command::new("/usr/bin/open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn open_system_browser(url: &str) -> Result<(), ()> {
+    use windows::{
+        core::PCWSTR,
+        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+    };
+
+    let operation = "open\0".encode_utf16().collect::<Vec<_>>();
+    let target = url
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // ShellExecuteW delegates the URL to the user's registered HTTPS handler.
+    // Unlike rundll32, its return value tells us whether Windows accepted the
+    // launch request, and it works for packaged as well as unpackaged builds.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn open_system_browser(_url: &str) -> Result<(), ()> {
+    Err(())
+}
+
+pub(crate) async fn fetch_desktop_bootstrap(
+    line_id: &str,
+) -> Result<DesktopBootstrap, AccountProjectionFailure> {
+    fetch_bootstrap(line_id).await
+}
+
+pub(crate) fn loopback_oauth_enabled_for_bootstrap(bootstrap: &DesktopBootstrap) -> bool {
+    match std::env::var("YESCHOY_LOOPBACK_OAUTH") {
+        Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO") => false,
+        Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => true,
+        _ => bootstrap.oauth_loopback_pkce_available,
+    }
+}
+
+/// Serialized size of the session payload. The Windows credential store caps a
+/// single blob at 2560 bytes, so a long refresh token fails the write for some
+/// accounts and not others. The length alone separates that from a locked
+/// keychain; no field content is ever logged.
+fn payload_len(session: &StoredSession) -> usize {
+    serde_json::to_string(session)
+        .map(|value| value.len())
+        .unwrap_or_default()
+}
+
+fn save_stored_session(session: &StoredSession) -> Result<(), ()> {
+    let payload = serde_json::to_string(session).map_err(|_| ())?;
+    crate::legacy::write_secret(KEYRING_SERVICE, KEYRING_USER, &payload).map_err(|_| ())
+}
+
+fn load_stored_session() -> Result<Option<StoredSession>, ()> {
+    // 改名前登录的人：登录凭据还在旧名字下面，读的时候搬过来。
+    match crate::legacy::read_secret(KEYRING_SERVICE, KEYRING_USER) {
+        Ok(Some(payload)) => {
+            let stored: StoredSession = serde_json::from_str(&payload).map_err(|_| ())?;
+            // 名单上不给连的站点发的登录：整份丢掉，当作没登录。留着的话，别的线路
+            // 续登录时会把它的凭据发给别的站点。
+            if line_is_refused_station(&stored.line_id) {
+                let _ = delete_stored_session();
+                return Ok(None);
+            }
+            Ok(Some(stored))
+        }
+        Ok(None) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// The origin a line's requests go to: a catalog route's, or the station's.
+fn origin_of_line(line_id: &str) -> Option<&str> {
+    station_connect_origin_from_line_id(line_id).or_else(|| line_origin(line_id))
+}
+
+fn forget_app_token(line_id: &str) {
+    if let Some(origin) = origin_of_line(line_id) {
+        app_token::forget(origin);
+    }
+}
+
+fn delete_stored_session() -> Result<(), ()> {
+    if let Ok(Some(stored)) = load_stored_session() {
+        forget_app_token(&stored.line_id);
+    }
+    crate::legacy::delete_secret(KEYRING_SERVICE, KEYRING_USER).map_err(|_| ())
+}
+
+/// Why a freshly issued bundle could not be installed. A server-contract
+/// violation and a credential-store fault used to collapse into one error,
+/// which pointed every "cannot sign in" report at the OS keychain even when
+/// the keychain was healthy and the bundle itself was malformed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum InstallFailure {
+    Contract,
+    Storage,
+}
+
+fn install_auth_bundle(
+    state: &AccountV2State,
+    line_id: &str,
+    bundle: AuthBundle,
+    epoch: u64,
+    device_code: Option<&str>,
+) -> Result<(), InstallFailure> {
+    let mut runtime = state.runtime.lock().map_err(|_| InstallFailure::Storage)?;
+    if runtime.authorization_epoch != epoch
+        || device_code.is_some_and(|code| {
+            runtime.pending.as_ref().map(|p| p.device_code.as_str()) != Some(code)
+        })
+    {
+        return Err(InstallFailure::Contract);
+    }
+    if bundle.token_type != "Bearer"
+        || bundle.access_token.len() < 32
+        || bundle.refresh_token.len() < 32
+        || bundle.session_id.is_empty()
+        || bundle.access_expires_at <= now_epoch_seconds()
+        || bundle.refresh_expires_at <= bundle.access_expires_at
+    {
+        log::warn!("account stage=auth_bundle_rejected reason=contract");
+        return Err(InstallFailure::Contract);
+    }
+    // A new sign-in may be a different account; a refresh is the same one,
+    // and the device credential the station issued to it still stands.
+    if device_code.is_some() {
+        forget_app_token(line_id);
+    }
+    let stored = StoredSession {
+        line_id: line_id.to_owned(),
+        refresh_token: bundle.refresh_token,
+        session_id: bundle.session_id,
+        refresh_expires_at: bundle.refresh_expires_at,
+        api_key: None,
+    };
+    // A credential store that refuses the write (locked keychain, no secret
+    // service, an oversized blob on Windows) fails the sign-in at the very
+    // last step, after the user already approved it in the browser.
+    save_stored_session(&stored).map_err(|_| {
+        log::warn!(
+            "account stage=session_store_failed bytes={}",
+            payload_len(&stored)
+        );
+        InstallFailure::Storage
+    })?;
+    runtime.access = Some(AccessSession {
+        access_token: bundle.access_token,
+        access_expires_at: bundle.access_expires_at,
+    });
+    runtime.pending = None;
+    Ok(())
+}
+
+fn install_failure(failure: InstallFailure) -> AccountProjectionFailure {
+    match failure {
+        InstallFailure::Contract => AccountProjectionFailure::InvalidResponse,
+        InstallFailure::Storage => AccountProjectionFailure::SecureStorage,
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum AccountProjectionFailure {
+    InvalidRequest,
+    Transport(TransportFailure),
+    BackendUnavailable,
+    IncompatibleServer,
+    SecureStorage,
+    SessionExpired,
+    InvalidResponse,
+}
+
+pub(crate) fn station_connect_projection_failure_reason(
+    failure: AccountProjectionFailure,
+) -> (&'static str, bool) {
+    match failure {
+        AccountProjectionFailure::SessionExpired => ("session_expired", true),
+        AccountProjectionFailure::SecureStorage => ("secure_storage_unavailable", false),
+        AccountProjectionFailure::BackendUnavailable => ("backend_unavailable", true),
+        AccountProjectionFailure::IncompatibleServer => ("incompatible_server", true),
+        AccountProjectionFailure::Transport(_) => ("network_error", true),
+        AccountProjectionFailure::InvalidResponse => ("invalid_response", true),
+        AccountProjectionFailure::InvalidRequest => ("invalid_account_request", false),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeSessionFailure {
+    SignedOut,
+    ServerUnavailable,
+    AccountChanged,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NativeSessionEpoch(u64);
+
+pub(crate) fn native_session_epoch(
+    state: &AccountV2State,
+) -> Result<NativeSessionEpoch, NativeSessionFailure> {
+    state
+        .runtime
+        .lock()
+        .map(|runtime| NativeSessionEpoch(runtime.authorization_epoch))
+        .map_err(|_| NativeSessionFailure::ServerUnavailable)
+}
+
+pub(crate) fn ensure_session_epoch(
+    state: &AccountV2State,
+    expected: NativeSessionEpoch,
+) -> Result<(), NativeSessionFailure> {
+    if native_session_epoch(state)?.0 != expected.0 {
+        return Err(NativeSessionFailure::AccountChanged);
+    }
+    Ok(())
+}
+
+async fn session_bound_step<T>(
+    state: &AccountV2State,
+    epoch: NativeSessionEpoch,
+    step: impl std::future::Future<Output = Result<T, NativeSessionFailure>>,
+) -> Result<T, NativeSessionFailure> {
+    ensure_session_epoch(state, epoch)?;
+    let result = step.await;
+    ensure_session_epoch(state, epoch)?;
+    result
+}
+
+/// One 野菜API login serves both catalog routes; a login at any other station
+/// serves that station only.
+fn session_serves_line(session_line_id: &str, line_id: &str) -> bool {
+    let catalog = |line: &str| line_origin(line).is_some();
+    if !persisted_session_line_id(session_line_id) {
+        // Sessions saved before the line was recorded are 野菜API logins.
+        return catalog(line_id);
+    }
+    session_line_id == line_id || (catalog(session_line_id) && catalog(line_id))
+}
+
+pub(crate) async fn native_session_access(
+    state: &AccountV2State,
+    line_id: &str,
+    epoch: NativeSessionEpoch,
+) -> Result<(String, String), NativeSessionFailure> {
+    // The access token is cached without its origin. A caller acting for a
+    // station other than the signed-in one (a tool still connected to the
+    // previous station) must get no token, never this station's.
+    match load_stored_session() {
+        Ok(Some(stored)) if session_serves_line(&stored.line_id, line_id) => {}
+        Ok(Some(_)) => return Err(NativeSessionFailure::AccountChanged),
+        Ok(None) => return Err(NativeSessionFailure::SignedOut),
+        Err(()) => return Err(NativeSessionFailure::ServerUnavailable),
+    }
+    let bootstrap = session_bound_step(state, epoch, async {
+        fetch_bootstrap(line_id)
+            .await
+            .map_err(|_| NativeSessionFailure::ServerUnavailable)
+    })
+    .await?;
+    let access_token = session_bound_step(state, epoch, async {
+        refresh_access(state, &bootstrap, line_id)
+            .await
+            .map_err(|failure| match failure {
+                AccountProjectionFailure::SessionExpired => NativeSessionFailure::SignedOut,
+                _ => NativeSessionFailure::ServerUnavailable,
+            })
+    })
+    .await?;
+    Ok((bootstrap.origin, access_token))
+}
+
+pub(crate) async fn native_account_json(
+    method: Method,
+    url: &str,
+    access_token: &str,
+    body: Option<Value>,
+) -> Result<(u16, Value), ()> {
+    // The key operations are written against the original contract's paths.
+    // For a station on the neutral contract they are re-addressed here, so
+    // every caller keeps working unchanged.
+    if let Some((origin, paths)) = neutral_station_for(url) {
+        if url[origin.len()..].starts_with(neutral::LEGACY_KEYS_PATH) {
+            return neutral::key_exchange(
+                method,
+                url,
+                body.as_ref(),
+                &origin,
+                &paths,
+                access_token,
+            )
+            .await;
+        }
+        let path = &url[origin.len()..];
+        if method == Method::GET && neutral::LEGACY_CATALOGUE_PATHS.contains(&path) {
+            let plans = send_json(
+                Method::GET,
+                &format!("{origin}{}", paths.plans),
+                Some(access_token),
+                None,
+            )
+            .await
+            .map_err(|_| ())?;
+            return Ok(neutral::catalogue_reply(
+                path,
+                plans.status.as_u16(),
+                &plans.value,
+            ));
+        }
+    }
+    let response = send_json(method, url, Some(access_token), body)
+        .await
+        .map_err(|_| ())?;
+    Ok((response.status.as_u16(), response.value))
+}
+
+/// Stations whose last accepted bootstrap spoke the neutral contract.
+static NEUTRAL_STATIONS: std::sync::Mutex<std::collections::BTreeMap<String, NeutralPaths>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn remember_dialect(bootstrap: &DesktopBootstrap) {
+    let mut stations = NEUTRAL_STATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &bootstrap.dialect {
+        StationDialect::Neutral(paths) => {
+            stations.insert(bootstrap.origin.clone(), paths.clone());
+        }
+        StationDialect::Legacy => {
+            stations.remove(&bootstrap.origin);
+        }
+    }
+}
+
+/// The neutral paths of the station `url` belongs to, if it is on that contract.
+pub(crate) fn neutral_station_for(url: &str) -> Option<(String, NeutralPaths)> {
+    NEUTRAL_STATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(origin, _)| {
+            url.strip_prefix(origin.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+        .map(|(origin, paths)| (origin.clone(), paths.clone()))
+}
+
+/// 诊断层（PRD 6.7，批次 3 #2）复用的只读 HTTPS 客户端：
+/// https-only、无重定向、无代理，与账户请求同一套约束。
+pub(crate) fn shared_http_client() -> Result<&'static Client, ()> {
+    client()
+}
+
+pub(crate) fn has_stored_session() -> bool {
+    matches!(load_stored_session(), Ok(Some(_)))
+}
+
+/// Fast local read of keyring session metadata (no network).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSessionSnapshot {
+    has_stored_session: bool,
+    stored_line_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn account_session_snapshot_v2() -> AccountSessionSnapshot {
+    let stored = load_stored_session().ok().flatten();
+    AccountSessionSnapshot {
+        has_stored_session: stored.is_some(),
+        stored_line_id: stored
+            .map(|session| session.line_id)
+            .filter(|line_id| !line_id.is_empty()),
+    }
+}
+
+const STATION_CONNECT_LINE_PREFIX: &str = "station_connect:";
+
+/// Maps a connect deep-link origin to the persisted `line_id`. Known YesChoy lines
+/// reuse the connectivity catalog; other HTTPS stations use a stable synthetic id
+/// until bootstrap-by-origin lands in a later task.
+pub(crate) fn line_id_for_station_connect_origin(origin: &str) -> String {
+    crate::request_diagnostics::line_for_origin(origin)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{STATION_CONNECT_LINE_PREFIX}{origin}"))
+}
+
+pub(crate) fn station_connect_origin_from_line_id(line_id: &str) -> Option<&str> {
+    // 名单上不给连的站点不算一条线路：界面递过来的、之前存下的都一样。
+    line_id
+        .strip_prefix(STATION_CONNECT_LINE_PREFIX)
+        .filter(|_| !line_is_refused_station(line_id))
+}
+
+/// 这条线路指向名单上不给连的站点：浏览器授权连的、粘贴密钥连的都算。
+fn line_is_refused_station(line_id: &str) -> bool {
+    line_id
+        .strip_prefix(STATION_CONNECT_LINE_PREFIX)
+        .or_else(|| line_id.strip_prefix("station_key:"))
+        .and_then(|origin| reqwest::Url::parse(origin).ok())
+        .is_some_and(|url| {
+            url.host_str()
+                .is_some_and(crate::station_connect::station_host_is_refused)
+        })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StationConnectAuthBundle {
+    pub(crate) access_token: String,
+    pub(crate) token_type: String,
+    pub(crate) access_expires_at: i64,
+    pub(crate) refresh_token: String,
+    pub(crate) refresh_expires_at: i64,
+    pub(crate) session_id: String,
+}
+
+/// Install credentials from a station connect exchange (no pending device-code step).
+pub(crate) fn install_station_connect_session(
+    state: &AccountV2State,
+    line_id: &str,
+    bundle: StationConnectAuthBundle,
+) -> Result<(), &'static str> {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "connect_secure_storage_unavailable")?;
+    if bundle.token_type != "Bearer"
+        || bundle.access_token.len() < 32
+        || bundle.refresh_token.len() < 32
+        || bundle.session_id.is_empty()
+        || bundle.access_expires_at <= now_epoch_seconds()
+        || bundle.refresh_expires_at <= bundle.access_expires_at
+    {
+        log::warn!("account stage=station_connect_bundle_rejected reason=contract");
+        return Err("connect_auth_contract");
+    }
+    forget_app_token(line_id);
+    let stored = StoredSession {
+        line_id: line_id.to_owned(),
+        refresh_token: bundle.refresh_token,
+        session_id: bundle.session_id,
+        refresh_expires_at: bundle.refresh_expires_at,
+        api_key: None,
+    };
+    save_stored_session(&stored).map_err(|_| {
+        log::warn!(
+            "account stage=station_connect_session_store_failed bytes={}",
+            payload_len(&stored)
+        );
+        "connect_secure_storage_unavailable"
+    })?;
+    runtime.authorization_epoch += 1;
+    runtime.access = Some(AccessSession {
+        access_token: bundle.access_token,
+        access_expires_at: bundle.access_expires_at,
+    });
+    runtime.pending = None;
+    Ok(())
+}
+
+pub(crate) enum ProbeSessionFailure {
+    SignedOut,
+    SecureStorage,
+    ServerUnavailable,
+}
+
+/// 为诊断的 API Key 有效性层取一个可用的短期访问令牌。
+/// 与账户读取共用刷新互斥与缓存；不落任何新状态。
+pub(crate) async fn native_probe_access(
+    state: &AccountV2State,
+) -> Result<String, ProbeSessionFailure> {
+    if let Ok(runtime) = state.runtime.lock() {
+        if let Some(access) = runtime.access.clone() {
+            if access.access_expires_at > now_epoch_seconds() + 30 {
+                return Ok(access.access_token);
+            }
+        }
+    }
+    let stored = load_stored_session().map_err(|_| ProbeSessionFailure::SecureStorage)?;
+    let Some(stored) = stored else {
+        return Err(ProbeSessionFailure::SignedOut);
+    };
+    if stored.api_key.is_some() {
+        return Err(ProbeSessionFailure::ServerUnavailable);
+    }
+    let line_id = if persisted_session_line_id(&stored.line_id) {
+        stored.line_id.clone()
+    } else {
+        CONNECTIVITY_LINES[0].line_id.to_owned()
+    };
+    let bootstrap = fetch_bootstrap(&line_id)
+        .await
+        .map_err(|_| ProbeSessionFailure::ServerUnavailable)?;
+    refresh_access(state, &bootstrap, &line_id)
+        .await
+        .map_err(|failure| match failure {
+            AccountProjectionFailure::SessionExpired => ProbeSessionFailure::SignedOut,
+            AccountProjectionFailure::SecureStorage => ProbeSessionFailure::SecureStorage,
+            _ => ProbeSessionFailure::ServerUnavailable,
+        })
+}
+
+fn failure_projection(request_id: String, failure: AccountProjectionFailure) -> AccountProjection {
+    match failure {
+        AccountProjectionFailure::InvalidRequest => {
+            AccountProjection::empty(request_id, "invalid_response", "invalid_request")
+        }
+        AccountProjectionFailure::Transport(TransportFailure::Network) => {
+            AccountProjection::empty(request_id, "network_error", "network_error")
+        }
+        AccountProjectionFailure::Transport(TransportFailure::TimedOut) => {
+            AccountProjection::empty(request_id, "network_error", "request_timed_out")
+        }
+        AccountProjectionFailure::Transport(TransportFailure::ResponseTooLarge) => {
+            AccountProjection::empty(request_id, "invalid_response", "response_too_large")
+        }
+        AccountProjectionFailure::Transport(
+            TransportFailure::InvalidResponse | TransportFailure::Unwell,
+        )
+        | AccountProjectionFailure::InvalidResponse => {
+            AccountProjection::empty(request_id, "invalid_response", "invalid_response")
+        }
+        AccountProjectionFailure::BackendUnavailable => {
+            AccountProjection::empty(request_id, "backend_unavailable", "server_not_ready")
+        }
+        AccountProjectionFailure::IncompatibleServer => {
+            AccountProjection::empty(request_id, "incompatible_server", "incompatible_server")
+        }
+        AccountProjectionFailure::SecureStorage => AccountProjection::empty(
+            request_id,
+            "secure_storage_unavailable",
+            "secure_storage_unavailable",
+        ),
+        AccountProjectionFailure::SessionExpired => {
+            AccountProjection::empty(request_id, "session_expired", "session_expired")
+        }
+    }
+}
+
+async fn refresh_access(
+    state: &AccountV2State,
+    bootstrap: &DesktopBootstrap,
+    line_id: &str,
+) -> Result<String, AccountProjectionFailure> {
+    // Refresh tokens may rotate. Concurrent page requests must share one
+    // refresh, rather than invalidating one another's credentials.
+    let permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| AccountProjectionFailure::BackendUnavailable)?;
+    let _refresh_guard = permit
+        .cancel_safe(state.refresh_guard.lock())
+        .await
+        .map_err(|_| AccountProjectionFailure::BackendUnavailable)?;
+    let epoch = state
+        .runtime
+        .lock()
+        .map_err(|_| AccountProjectionFailure::SecureStorage)?
+        .authorization_epoch;
+    if let Some(access) = state
+        .runtime
+        .lock()
+        .map_err(|_| AccountProjectionFailure::SecureStorage)?
+        .access
+        .clone()
+    {
+        if access.access_expires_at > now_epoch_seconds() + 30 {
+            return Ok(access.access_token);
+        }
+    }
+    let Some(stored) =
+        load_stored_session().map_err(|_| AccountProjectionFailure::SecureStorage)?
+    else {
+        return Err(AccountProjectionFailure::SessionExpired);
+    };
+    // A pasted-key session has no refresh token and never expires on a clock.
+    // Without this it would fall into the expiry branch below and be deleted
+    // the first time anything asked for an account token.
+    if stored.api_key.is_some() {
+        return Err(AccountProjectionFailure::BackendUnavailable);
+    }
+    if stored.refresh_expires_at <= now_epoch_seconds() {
+        let runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| AccountProjectionFailure::SecureStorage)?;
+        if runtime.authorization_epoch == epoch {
+            let _ = delete_stored_session();
+        }
+        return Err(AccountProjectionFailure::SessionExpired);
+    }
+
+    // A login belongs to the 野菜API account, not to the currently selected
+    // acceleration route. Refresh through the route that issued the session,
+    // then use the short-lived access token with whichever route the user is
+    // viewing. This keeps a mainland/global switch from looking like logout.
+    let refresh_line_id = if persisted_session_line_id(&stored.line_id) {
+        stored.line_id.clone()
+    } else {
+        line_id.to_owned()
+    };
+    let refresh_origin = if refresh_line_id == line_id {
+        bootstrap.origin.clone()
+    } else {
+        fetch_bootstrap(&refresh_line_id).await?.origin
+    };
+    if permit.is_cancelled() {
+        return Err(AccountProjectionFailure::BackendUnavailable);
+    }
+    let response = send_json(
+        Method::POST,
+        &format!("{}{}", refresh_origin, REFRESH_PATH),
+        None,
+        Some(json!({
+            "refresh_token": stored.refresh_token,
+            "session_id": stored.session_id,
+        })),
+    )
+    .await
+    .map_err(AccountProjectionFailure::Transport)?;
+    if response.status == StatusCode::UNAUTHORIZED || response.status == StatusCode::FORBIDDEN {
+        if let Ok(mut runtime) = state.runtime.lock() {
+            if runtime.authorization_epoch == epoch {
+                let _ = delete_stored_session();
+                runtime.access = None;
+            }
+        }
+        return Err(AccountProjectionFailure::SessionExpired);
+    }
+    if !response.status.is_success() {
+        return Err(AccountProjectionFailure::BackendUnavailable);
+    }
+    let envelope: DataEnvelope<AuthBundle> = serde_json::from_value(response.value)
+        .map_err(|_| AccountProjectionFailure::InvalidResponse)?;
+    if !envelope.success {
+        return Err(AccountProjectionFailure::InvalidResponse);
+    }
+    let access_token = envelope.data.access_token.clone();
+    install_auth_bundle(state, &refresh_line_id, envelope.data, epoch, None)
+        .map_err(install_failure)?;
+    Ok(access_token)
+}
+
+async fn account_data(
+    request_id: String,
+    bootstrap: &DesktopBootstrap,
+    access_token: &str,
+) -> Result<AccountProjection, AccountProjectionFailure> {
+    let permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| AccountProjectionFailure::BackendUnavailable)?;
+    permit
+        .cancel_safe(account_data_read(request_id, bootstrap, access_token))
+        .await
+        .map_err(|_| AccountProjectionFailure::BackendUnavailable)?
+}
+
+async fn account_data_read(
+    request_id: String,
+    bootstrap: &DesktopBootstrap,
+    access_token: &str,
+) -> Result<AccountProjection, AccountProjectionFailure> {
+    if let StationDialect::Neutral(paths) = &bootstrap.dialect {
+        return account_data_read_neutral(request_id, bootstrap, paths, access_token).await;
+    }
+    let account_url = format!("{}{}", bootstrap.origin, ACCOUNT_PATH);
+    let usage_url = format!("{}{}", bootstrap.origin, USAGE_PATH);
+    let models_url = format!("{}{}", bootstrap.origin, MODELS_PATH);
+    let pricing_url = format!("{}{}", bootstrap.origin, PRICING_PATH);
+    let status_url = format!("{}/api/status", bootstrap.origin);
+    let logs_url = format!("{}{}", bootstrap.origin, RECENT_LOGS_PATH);
+    let (account, usage, models, pricing, status, logs) = tokio::join!(
+        send_json(Method::GET, &account_url, Some(access_token), None),
+        send_json(Method::GET, &usage_url, Some(access_token), None),
+        send_json(Method::GET, &models_url, Some(access_token), None),
+        send_json(Method::GET, &pricing_url, Some(access_token), None),
+        send_json(Method::GET, &status_url, None, None),
+        send_json(Method::GET, &logs_url, Some(access_token), None),
+    );
+    if [&account, &usage, &models]
+        .iter()
+        .any(|response| matches!(response, Ok(value) if value.status == StatusCode::UNAUTHORIZED || value.status == StatusCode::FORBIDDEN))
+        || matches!(&pricing, Ok(value) if value.status == StatusCode::UNAUTHORIZED)
+    {
+        // The access token was already obtained (or refreshed) through the
+        // route that owns this account session. A second route can briefly lag
+        // behind or reject that token while deployments converge. Treat that
+        // as a route outage so the renderer keeps the signed-in projection;
+        // only refresh_access may prove the account session itself expired.
+        return Err(AccountProjectionFailure::BackendUnavailable);
+    }
+    let account_value = account.ok().filter(|value| value.status.is_success());
+    let usage_value = usage.ok().filter(|value| value.status.is_success());
+    let models_value = models.ok().filter(|value| value.status.is_success());
+    let pricing_value = pricing.ok().filter(|value| value.status.is_success());
+    let status_value = status.ok().filter(|value| value.status.is_success());
+    let logs_value = logs.ok().filter(|value| value.status.is_success());
+    // PRD 6.6：首页日志满页且尚未覆盖 30 天窗口时补拉后续页（最多 5 页）。
+    let observed_now = now_epoch_ms();
+    let log_pages =
+        usage_log_pages(bootstrap, access_token, logs_value.as_ref(), observed_now).await;
+    let account_summary = parse_account(
+        account_value.as_ref().map(|value| &value.value),
+        status_value.as_ref().map(|value| &value.value),
+    );
+    let usage_summary = parse_usage(usage_value.as_ref().map(|value| &value.value));
+    let comparison_fx = data_object(status_value.as_ref().map(|value| &value.value))
+        .and_then(|data| positive_number(data.get("usd_exchange_rate")));
+    let models = parse_models(
+        models_value.as_ref().map(|value| &value.value),
+        pricing_value.as_ref().map(|value| &value.value),
+        account_value.as_ref().map(|value| &value.value),
+        comparison_fx,
+    );
+    if !account_summary.available {
+        // The single most common "approved on the website but the app keeps
+        // waiting" path: authorization already succeeded and only this
+        // projection failed. Record whether the call itself failed or its
+        // payload did not parse, so the two are never confused again.
+        log::warn!(
+            "account stage=account_projection_unavailable http_ok={}",
+            account_value.is_some()
+        );
+        return Err(AccountProjectionFailure::InvalidResponse);
+    }
+    let money = account_money(
+        status_value.as_ref().map(|v| &v.value),
+        &account_summary.balance_quota,
+        &account_summary.used_quota,
+    );
+    let savings = recent_savings(
+        status_value.as_ref().map(|v| &v.value),
+        logs_value.as_ref().map(|v| &v.value),
+    );
+    let mut usage_log = usage_log_report(
+        status_value.as_ref().map(|v| &v.value),
+        &log_pages,
+        observed_now,
+    );
+    crate::probe_marks::label(&mut usage_log.records);
+    // 直连后本地不再观测请求，"最近中转记录"改由服务端消费日志提供，
+    // 按客户端为每个工具创建的 token 名称归因。
+    if let Some(line_id) = crate::request_diagnostics::line_for_origin(&bootstrap.origin) {
+        for (tool, observation) in recent_requests_from_pages(&log_pages, line_id) {
+            crate::request_diagnostics::publish(&tool, observation);
+        }
+    }
+    let reason_code = if usage_summary.available
+        && models_value.is_some()
+        && pricing_value.is_some()
+        && comparison_fx.is_some()
+        && !money.currency.is_empty()
+        && savings.status != "unavailable"
+        && usage_log.status != "unavailable"
+    {
+        "none"
+    } else {
+        "partial_data"
+    };
+    Ok(AccountProjection {
+        request_id,
+        schema_version: 6,
+        status: "signed_in",
+        user_code: String::new(),
+        poll_after_seconds: 0,
+        expires_at_epoch_ms: 0,
+        observed_at_epoch_ms: observed_now,
+        account: account_summary,
+        usage: usage_summary,
+        models,
+        comparison_fx: comparison_fx.map(decimal).unwrap_or_default(),
+        money,
+        savings,
+        usage_log,
+        reason_code,
+    })
+}
+
+/// The same projection, read from a station on the neutral contract.
+async fn account_data_read_neutral(
+    request_id: String,
+    bootstrap: &DesktopBootstrap,
+    paths: &NeutralPaths,
+    access_token: &str,
+) -> Result<AccountProjection, AccountProjectionFailure> {
+    let url = |path: &str| format!("{}{}", bootstrap.origin, path);
+    let records_url = |page: usize| {
+        format!(
+            "{}?page={page}&pageSize={USAGE_LOG_PAGE_SIZE}",
+            url(&paths.usage_records)
+        )
+    };
+    let (account_url, plans_url, usage_url, first_records_url) = (
+        url(&paths.account),
+        url(&paths.plans),
+        url(&paths.usage_summary),
+        records_url(1),
+    );
+    let (account, plans, usage, records) = tokio::join!(
+        send_json(Method::GET, &account_url, Some(access_token), None),
+        send_json(Method::GET, &plans_url, Some(access_token), None),
+        send_json(Method::GET, &usage_url, Some(access_token), None),
+        send_json(Method::GET, &first_records_url, Some(access_token), None),
+    );
+    if [&account, &plans, &usage].iter().any(|response| {
+        matches!(response, Ok(value) if value.status == StatusCode::UNAUTHORIZED || value.status == StatusCode::FORBIDDEN)
+    }) {
+        // Same reasoning as the original reader: only refresh_access may
+        // decide the session itself is gone.
+        return Err(AccountProjectionFailure::BackendUnavailable);
+    }
+    let ok = |response: Result<JsonResponse, TransportFailure>| {
+        response
+            .ok()
+            .filter(|value| value.status.is_success())
+            .map(|value| value.value)
+    };
+    let (account, plans, usage, records) = (ok(account), ok(plans), ok(usage), ok(records));
+    let observed_now = now_epoch_ms();
+    let Some(currency) = neutral::currency(account.as_ref()) else {
+        log::warn!(
+            "account stage=account_projection_unavailable dialect=neutral http_ok={}",
+            account.is_some()
+        );
+        return Err(AccountProjectionFailure::InvalidResponse);
+    };
+    let status = neutral::status_shape(currency);
+    let account_summary = parse_account(
+        neutral::account_shape(account.as_ref()).as_ref(),
+        Some(&status),
+    );
+    if !account_summary.available {
+        log::warn!("account stage=account_projection_unavailable dialect=neutral http_ok=true");
+        return Err(AccountProjectionFailure::InvalidResponse);
+    }
+    let usage_summary = parse_usage(neutral::usage_shape(usage.as_ref()).as_ref());
+    let models = neutral::models(plans.as_ref());
+
+    // Same window rule as the original reader: more pages only while the
+    // first one is full and has not yet reached back thirty days.
+    let mut log_pages: Vec<Value> = neutral::records_shape(records.as_ref())
+        .into_iter()
+        .collect();
+    let first_is_full_and_recent = log_pages.first().is_some_and(|page| {
+        let items = page["data"]["items"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let oldest_ms = items
+            .iter()
+            .filter_map(|row| row.get("created_at").and_then(Value::as_u64))
+            .map(|seconds| seconds * 1000)
+            .min()
+            .unwrap_or(0);
+        items.len() >= USAGE_LOG_PAGE_SIZE
+            && oldest_ms > observed_now.saturating_sub(USAGE_WINDOW_MS)
+    });
+    if first_is_full_and_recent {
+        let (url_2, url_3, url_4, url_5) = (
+            records_url(2),
+            records_url(3),
+            records_url(4),
+            records_url(5),
+        );
+        let (second, third, fourth, fifth) = tokio::join!(
+            send_json(Method::GET, &url_2, Some(access_token), None),
+            send_json(Method::GET, &url_3, Some(access_token), None),
+            send_json(Method::GET, &url_4, Some(access_token), None),
+            send_json(Method::GET, &url_5, Some(access_token), None),
+        );
+        for response in [second, third, fourth, fifth] {
+            match neutral::records_shape(ok(response).as_ref()) {
+                Some(page) => log_pages.push(page),
+                None => break,
+            }
+        }
+    }
+
+    let money = account_money(
+        Some(&status),
+        &account_summary.balance_quota,
+        &account_summary.used_quota,
+    );
+    let savings = recent_savings(Some(&status), log_pages.first());
+    let mut usage_log = usage_log_report(Some(&status), &log_pages, observed_now);
+    crate::probe_marks::label(&mut usage_log.records);
+    if let Some(line_id) = crate::request_diagnostics::line_for_origin(&bootstrap.origin) {
+        for (tool, observation) in recent_requests_from_pages(&log_pages, line_id) {
+            crate::request_diagnostics::publish(&tool, observation);
+        }
+    }
+    let reason_code = if usage_summary.available
+        && models.is_some()
+        && !money.currency.is_empty()
+        && usage_log.status != "unavailable"
+    {
+        "none"
+    } else {
+        "partial_data"
+    };
+    app_token::ensure(&bootstrap.origin, paths, access_token).await;
+    Ok(AccountProjection {
+        request_id,
+        schema_version: 6,
+        status: "signed_in",
+        user_code: String::new(),
+        poll_after_seconds: 0,
+        expires_at_epoch_ms: 0,
+        observed_at_epoch_ms: observed_now,
+        account: account_summary,
+        usage: usage_summary,
+        models: models.unwrap_or_default(),
+        // Prices already arrive in the station's currency, which each plan
+        // names: there is nothing left to convert.
+        comparison_fx: "1".into(),
+        money,
+        savings,
+        usage_log,
+        reason_code,
+    })
+}
+
+/// 分页拉取 `/api/log/self`：第 1 页来自六路并发；仅当首页满 100 条且
+/// 尚未覆盖 30 天窗口时，并发补拉第 2..=5 页。任何一页失败即停止追加
+/// （已有前缀足够，报告侧按截断口径呈现）。
+async fn usage_log_pages(
+    bootstrap: &DesktopBootstrap,
+    access_token: &str,
+    first_page: Option<&JsonResponse>,
+    now_epoch_ms: u64,
+) -> Vec<Value> {
+    let Some(first) = first_page else {
+        return Vec::new();
+    };
+    let mut pages = vec![first.value.clone()];
+    let Some(items) = first
+        .value
+        .get("data")
+        .and_then(|data| data.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return pages;
+    };
+    if items.len() < USAGE_LOG_PAGE_SIZE {
+        return pages;
+    }
+    let cutoff = now_epoch_ms.saturating_sub(USAGE_WINDOW_MS);
+    let oldest_ms = items
+        .iter()
+        .filter_map(|row| row.get("created_at").and_then(Value::as_u64))
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds * 1000)
+        .min()
+        .unwrap_or(0);
+    if oldest_ms <= cutoff {
+        return pages;
+    }
+    let base = format!("{}{}", bootstrap.origin, "/api/log/self");
+    let page_url = |page: usize| format!("{base}?p={page}&page_size={USAGE_LOG_PAGE_SIZE}&type=2");
+    let (url_2, url_3, url_4, url_5) = (page_url(2), page_url(3), page_url(4), page_url(5));
+    let (second, third, fourth, fifth) = tokio::join!(
+        send_json(Method::GET, &url_2, Some(access_token), None),
+        send_json(Method::GET, &url_3, Some(access_token), None),
+        send_json(Method::GET, &url_4, Some(access_token), None),
+        send_json(Method::GET, &url_5, Some(access_token), None),
+    );
+    for response in [second, third, fourth, fifth] {
+        match response {
+            Ok(value) if value.status.is_success() => pages.push(value.value),
+            _ => break,
+        }
+    }
+    pages
+}
+
+fn data_value(value: Option<&Value>) -> Option<&Value> {
+    let envelope = value?.as_object()?;
+    if !envelope.get("success")?.as_bool()? {
+        return None;
+    }
+    envelope.get("data")
+}
+
+fn data_object(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
+    data_value(value)?.as_object()
+}
+
+fn non_negative_integer(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(number) = value.as_u64() {
+        return Some(number.to_string());
+    }
+    value
+        .as_i64()
+        .filter(|number| *number >= 0)
+        .map(|number| number.to_string())
+}
+
+fn signed_integer(value: Option<&Value>) -> Option<String> {
+    value?.as_i64().map(|number| number.to_string())
+}
+
+fn positive_number(value: Option<&Value>) -> Option<f64> {
+    value?
+        .as_f64()
+        .filter(|number| number.is_finite() && *number > 0.0)
+}
+
+fn bounded_text(value: Option<&Value>, maximum: usize) -> String {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return String::new();
+    };
+    if value.chars().count() > maximum
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return String::new();
+    }
+    value.to_owned()
+}
+
+// Pricing rules may be formatted across lines. Normalize whitespace outside
+// quoted strings only; keep the existing bounds/control-character checks.
+fn billing_expression(value: Option<&Value>) -> String {
+    let Some(raw) = value.and_then(Value::as_str) else {
+        return String::new();
+    };
+    if raw.chars().count() > 8192 {
+        return String::new();
+    }
+    let mut quoted = false;
+    let mut escaped = false;
+    let normalized: String = raw
+        .chars()
+        .map(|c| {
+            let in_string = quoted;
+            if c == '"' && !escaped {
+                quoted = !quoted;
+            }
+            escaped = in_string && !escaped && c == '\\';
+            if !in_string && matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    bounded_text(Some(&Value::String(normalized)), 8192)
+}
+
+fn parse_account(account: Option<&Value>, status: Option<&Value>) -> AccountSummary {
+    let Some(data) = data_object(account) else {
+        return AccountSummary::default();
+    };
+    // The balance is the only load-bearing field: without it there is no
+    // account to render. The two counters below are display-only, and a
+    // backend that omits either (a brand-new account has made no requests)
+    // must not cost the user the entire sign-in. Missing stays missing —
+    // the renderer shows "—" rather than inventing a zero.
+    let Some(quota) = signed_integer(data.get("quota")) else {
+        return AccountSummary::default();
+    };
+    let used_quota = non_negative_integer(data.get("used_quota")).unwrap_or_default();
+    let request_count = non_negative_integer(data.get("request_count")).unwrap_or_default();
+    let quota_per_unit = data_object(status)
+        .and_then(|value| positive_number(value.get("quota_per_unit")))
+        .map(decimal)
+        .unwrap_or_default();
+    AccountSummary {
+        available: true,
+        display_name: bounded_text(data.get("display_name"), 160),
+        username: bounded_text(data.get("username"), 160),
+        balance_quota: quota,
+        used_quota,
+        request_count,
+        quota_per_unit,
+    }
+}
+
+fn parse_usage(value: Option<&Value>) -> UsageSummary {
+    let Some(data) = data_object(value) else {
+        return UsageSummary::default();
+    };
+    let (Some(quota), Some(rpm), Some(tpm)) = (
+        non_negative_integer(data.get("quota")),
+        non_negative_integer(data.get("rpm")),
+        non_negative_integer(data.get("tpm")),
+    ) else {
+        return UsageSummary::default();
+    };
+    UsageSummary {
+        available: true,
+        consumed_quota: quota,
+        request_rate: rpm,
+        token_count: tpm,
+    }
+}
+
+fn nonnegative_number(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+fn pricing_endpoint_types(row: &Value) -> BTreeSet<String> {
+    row.get("supported_endpoint_types")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.chars().count() <= 80 && !value.chars().any(char::is_control)
+        })
+        .take(32)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn row_covers_group(row: &Value, group_id: &str) -> bool {
+    row.get("enable_groups")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|group| group.as_str() == Some(group_id) || group.as_str() == Some("all"))
+        })
+}
+
+pub(crate) fn billing_groups(pricing: &Value, model_id: &str) -> Vec<BillingGroup> {
+    if pricing.get("success").and_then(Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    let Some(usable) = pricing.get("usable_group").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let rows = pricing.get("data").and_then(Value::as_array);
+    usable
+        .iter()
+        .filter_map(|(id, description)| {
+            if id.is_empty()
+                || id == "auto"
+                || id.chars().count() > 128
+                || id.chars().any(|c| {
+                    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                })
+            {
+                return None;
+            }
+            let matching = rows
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    row["model_name"].as_str() == Some(model_id) && row_covers_group(row, id)
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return None;
+            }
+            let mut endpoints = BTreeSet::new();
+            for row in &matching {
+                endpoints.extend(pricing_endpoint_types(row));
+            }
+            Some(BillingGroup {
+                plan: None,
+                id: id.clone(),
+                description: bounded_text(Some(description), 500),
+                ratio: nonnegative_number(pricing.get("group_ratio").and_then(|v| v.get(id))),
+                supported_endpoint_types: endpoints.into_iter().collect(),
+            })
+        })
+        .take(128)
+        .collect()
+}
+
+fn parse_models(
+    models: Option<&Value>,
+    pricing: Option<&Value>,
+    account: Option<&Value>,
+    comparison_fx: Option<f64>,
+) -> Vec<AccountModel> {
+    let available = data_value(models)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|id| !id.is_empty() && id.chars().count() <= 200)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let Some(pricing_root) = pricing.and_then(Value::as_object) else {
+        return available.into_iter().map(unpriced_model).collect();
+    };
+    if pricing_root.get("success").and_then(Value::as_bool) != Some(true) {
+        return available.into_iter().map(unpriced_model).collect();
+    }
+    let user_group = data_object(account)
+        .map(|data| bounded_text(data.get("group"), 128))
+        .unwrap_or_default();
+    let group_ratios = pricing_root
+        .get("group_ratio")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let account_ratio = group_ratios
+        .get(&user_group)
+        .and_then(|value| positive_number(Some(value)))
+        .or_else(|| {
+            group_ratios
+                .get("default")
+                .and_then(|value| positive_number(Some(value)))
+        });
+    let mut by_name: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    if let Some(rows) = pricing_root.get("data").and_then(Value::as_array) {
+        for row in rows.iter().take(4096) {
+            let Some(object) = row.as_object() else {
+                continue;
+            };
+            let name = bounded_text(object.get("model_name"), 200);
+            if !name.is_empty() && available.contains(&name) {
+                by_name
+                    .entry(name)
+                    .or_default()
+                    .push(Value::Object(object.clone()));
+            }
+        }
+    }
+    available
+        .into_iter()
+        .map(|id| {
+            let Some(rows) = by_name.get(&id) else {
+                return unpriced_model(id);
+            };
+            let row = &rows[0];
+            // Pricing descriptions may contain internal upstream routing labels.
+            // They are not reviewed customer-facing model metadata. Keep the
+            // schema field empty instead of forwarding them across renderer IPC.
+            let quota_type = row.get("quota_type").and_then(Value::as_i64);
+            let billing_mode = match bounded_text(row.get("billing_mode"), 40).as_str() {
+                "tiered_expr" => "tiered_expr",
+                "per_request" => "per_request",
+                "ratio" => "ratio",
+                _ if quota_type == Some(0) => "ratio",
+                _ if quota_type == Some(1) => "per_request",
+                _ => "unknown",
+            };
+            let supported_endpoint_types = rows
+                .iter()
+                .flat_map(pricing_endpoint_types)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let ratio = positive_number(row.get("model_ratio"));
+            let completion = positive_number(row.get("completion_ratio"));
+            let comparable = billing_mode == "ratio"
+                && ratio.is_some()
+                && completion.is_some()
+                && account_ratio.is_some()
+                && comparison_fx.is_some();
+            let (official_input, official_output, actual_input, actual_output) = if comparable {
+                let official_input = ratio.unwrap() * 2.0 * comparison_fx.unwrap();
+                let official_output = official_input * completion.unwrap();
+                let actual_input = official_input * account_ratio.unwrap();
+                let actual_output = official_output * account_ratio.unwrap();
+                (
+                    money(official_input),
+                    money(official_output),
+                    money(actual_input),
+                    money(actual_output),
+                )
+            } else {
+                (String::new(), String::new(), String::new(), String::new())
+            };
+            let base_input = nonnegative_number(row.get("model_ratio")).map(|n| n * 2.0);
+            let base_output = base_input
+                .zip(nonnegative_number(row.get("completion_ratio")))
+                .map(|(input, completion)| input * completion)
+                .filter(|n| n.is_finite());
+            AccountModel {
+                id: id.clone(),
+                description: String::new(),
+                billing_mode,
+                // A priced row speaks for itself, empty list included: the
+                // relay really is saying this model has no usable endpoint
+                // (codexpro/ is exactly that today).
+                supported_endpoint_types: Some(supported_endpoint_types),
+                pricing_available: comparable,
+                official_input_cny_per_million: official_input,
+                official_output_cny_per_million: official_output,
+                actual_input_cny_per_million: actual_input,
+                actual_output_cny_per_million: actual_output,
+                billing: Some(ModelBilling {
+                    groups: billing_groups(pricing.unwrap(), &id),
+                    base_input_usd: base_input.filter(|n| n.is_finite()),
+                    base_output_usd: base_output,
+                    cache_read_usd: base_input
+                        .zip(nonnegative_number(row.get("cache_ratio")))
+                        .map(|(input, ratio)| input * ratio)
+                        .filter(|n| n.is_finite()),
+                    cache_write_usd: base_input
+                        .zip(nonnegative_number(row.get("cache_creation_ratio")))
+                        .map(|(input, ratio)| input * ratio)
+                        .filter(|n| n.is_finite()),
+                    request_usd: nonnegative_number(row.get("model_price")),
+                    expression: billing_expression(row.get("billing_expr")),
+                }),
+            }
+        })
+        .collect()
+}
+
+fn unpriced_model(id: String) -> AccountModel {
+    AccountModel {
+        id,
+        description: String::new(),
+        billing_mode: "unknown",
+        supported_endpoint_types: None,
+        pricing_available: false,
+        official_input_cny_per_million: String::new(),
+        official_output_cny_per_million: String::new(),
+        actual_input_cny_per_million: String::new(),
+        actual_output_cny_per_million: String::new(),
+        billing: None,
+    }
+}
+
+fn decimal(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.6}").trim_end_matches('0').to_owned()
+    }
+}
+
+fn money(value: f64) -> String {
+    format!("{value:.4}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+async fn inspect_inner(
+    state: &AccountV2State,
+    request: &AccountRequest,
+) -> Result<AccountProjection, AccountProjectionFailure> {
+    if let Some(origin) = key_session::origin_from_line_id(&request.line_id) {
+        return key_session::inspect(request, origin).await;
+    }
+    let bootstrap = fetch_bootstrap(&request.line_id).await?;
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| AccountProjectionFailure::SecureStorage)?;
+        runtime.wallet_url = Some(bootstrap.wallet_url.clone());
+    }
+    let access_token = match refresh_access(state, &bootstrap, &request.line_id).await {
+        Ok(token) => token,
+        Err(AccountProjectionFailure::SessionExpired) => {
+            return Ok(AccountProjection::empty(
+                request.request_id.clone(),
+                "signed_out",
+                if bootstrap.device_authorization_available {
+                    "signed_out"
+                } else {
+                    "authorization_unavailable"
+                },
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    account_data(request.request_id.clone(), &bootstrap, &access_token).await
+}
+
+#[tauri::command]
+pub async fn account_inspect_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AccountProjection, String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let epoch = state
+        .runtime
+        .lock()
+        .map_err(|_| "account_state_unavailable")?
+        .authorization_epoch;
+    // 站点慢或 DNS 挂了时，绝不能不返回：整条检查最多 INSPECT_DEADLINE。
+    let inspected = tokio::time::timeout(INSPECT_DEADLINE, inspect_inner(&state, &request)).await;
+    Ok(match inspected {
+        Err(_) => {
+            log::warn!(
+                "account stage=inspect_deadline_exceeded request_id={} limit_ms={}",
+                request.request_id,
+                INSPECT_DEADLINE.as_millis()
+            );
+            failure_projection(
+                request.request_id,
+                AccountProjectionFailure::Transport(TransportFailure::TimedOut),
+            )
+        }
+        Ok(Ok(projection)) => projection,
+        Ok(Err(AccountProjectionFailure::SessionExpired)) => {
+            if let Ok(mut runtime) = state.runtime.lock() {
+                if runtime.authorization_epoch == epoch {
+                    let _ = delete_stored_session();
+                    runtime.access = None;
+                }
+            }
+            failure_projection(request.request_id, AccountProjectionFailure::SessionExpired)
+        }
+        Ok(Err(error)) => failure_projection(request.request_id, error),
+    })
+}
+
+/// Sanitize a raw hostname into a server-safe `device_name` value.
+/// Returns None when the result would be empty; caps length at 64 chars.
+fn sanitize_device_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.chars().take(64).collect())
+}
+
+/// Best-effort local device name (client autonomy #23): Windows exposes
+/// COMPUTERNAME; other platforms fall back to the `hostname` command.
+/// Failure is non-fatal — the begin request simply omits the field.
+fn device_name() -> Option<String> {
+    let raw = std::env::var("COMPUTERNAME").ok().or_else(|| {
+        Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    })?;
+    sanitize_device_name(&raw)
+}
+
+#[tauri::command]
+pub async fn account_begin_authorization_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AccountProjection, String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let epoch = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "account_state_unavailable")?;
+        runtime.authorization_epoch += 1;
+        runtime.pending = None;
+        runtime.authorization_epoch
+    };
+    let bootstrap = match fetch_bootstrap(&request.line_id).await {
+        Ok(value) => value,
+        Err(error) => return Ok(failure_projection(request.request_id, error)),
+    };
+    if !bootstrap.device_authorization_available {
+        return Ok(AccountProjection::empty(
+            request.request_id,
+            "backend_unavailable",
+            "authorization_unavailable",
+        ));
+    }
+    if _permit.is_cancelled() {
+        return Err("assistant_shutting_down".into());
+    }
+    // 客户端自治（#23）：附 device_name 供授权页展示。线上已验证服务端
+    // 容忍未知字段（2026-09-13 probe 200）；获取失败时省略该字段。
+    let mut body = json!({"client_name": "野菜API Desktop"});
+    if let Some(name) = device_name() {
+        body["device_name"] = Value::String(name);
+    }
+    let response = match send_json(
+        Method::POST,
+        &format!("{}{}", bootstrap.origin, AUTHORIZATION_PATH),
+        None,
+        Some(body),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(failure_projection(
+                request.request_id,
+                AccountProjectionFailure::Transport(error),
+            ))
+        }
+    };
+    if !response.status.is_success() {
+        return Ok(AccountProjection::empty(
+            request.request_id,
+            "backend_unavailable",
+            "authorization_unavailable",
+        ));
+    }
+    let envelope: DataEnvelope<DeviceAuthorization> = match serde_json::from_value(response.value) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(failure_projection(
+                request.request_id,
+                AccountProjectionFailure::InvalidResponse,
+            ))
+        }
+    };
+    let authorization = envelope.data;
+    // 服务器回报的 verification_uri：内置线路沿用原规则（必须是 yeschoy.com，
+    // 与旧版本行为完全一致）；第三方站点必须是它自己的、已被用户信任的来源。
+    let page_origin = if station_connect_origin_from_line_id(&request.line_id).is_some() {
+        authorization_page_origin_for_line(&request.line_id)
+    } else {
+        Some(CANONICAL_AUTHORIZATION_PAGE_ORIGIN.to_owned())
+    };
+    let valid = envelope.success
+        && authorization.device_code.len() >= 32
+        && authorization.device_code.len() <= 128
+        && user_code_is_valid(&authorization.user_code)
+        && authorization.expires_in > 0
+        && authorization.expires_in <= 600
+        && authorization.interval > 0
+        && authorization.interval <= 60
+        && page_origin.as_deref().is_some_and(|origin| {
+            authorization.verification_uri == format!("{origin}{AUTHORIZATION_PAGE_PATH}")
+                && authorization_url_is_allowed_for(
+                    &authorization.verification_uri_complete,
+                    &authorization.user_code,
+                    origin,
+                )
+        });
+    if !valid {
+        return Ok(failure_projection(
+            request.request_id,
+            AccountProjectionFailure::InvalidResponse,
+        ));
+    }
+    let Some(browser_url) =
+        browser_authorization_url_for_line(&request.line_id, &authorization.user_code)
+    else {
+        return Ok(failure_projection(
+            request.request_id,
+            AccountProjectionFailure::InvalidResponse,
+        ));
+    };
+    let pending = PendingAuthorization {
+        line_id: request.line_id,
+        device_code: authorization.device_code,
+        user_code: authorization.user_code,
+        expires_at_epoch_ms: now_epoch_ms()
+            .saturating_add(authorization.expires_in.saturating_mul(1000)),
+        poll_after_seconds: authorization.interval,
+    };
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "account_state_unavailable".to_owned())?;
+        if runtime.authorization_epoch != epoch {
+            return Ok(AccountProjection::empty(
+                request.request_id,
+                "cancelled",
+                "authorization_cancelled",
+            ));
+        }
+        runtime.pending = Some(pending.clone());
+        runtime.wallet_url = Some(bootstrap.wallet_url);
+    }
+    if _permit.is_cancelled() {
+        return Err("assistant_shutting_down".into());
+    }
+    let reason = if open_system_browser(&browser_url).is_ok() {
+        "authorization_pending"
+    } else {
+        "browser_open_failed"
+    };
+    Ok(AccountProjection::pending(
+        request.request_id,
+        &pending,
+        reason,
+    ))
+}
+
+#[tauri::command]
+pub fn account_open_authorization_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AccountProjection, String> {
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let pending = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "account_state_unavailable")?;
+        let Some(pending) = runtime
+            .pending
+            .as_ref()
+            .filter(|pending| pending.line_id == request.line_id)
+            .cloned()
+        else {
+            return Ok(AccountProjection::empty(
+                request.request_id,
+                "signed_out",
+                "authorization_not_pending",
+            ));
+        };
+        if pending.expires_at_epoch_ms <= now_epoch_ms() {
+            runtime.authorization_epoch = runtime.authorization_epoch.saturating_add(1);
+            runtime.pending = None;
+            return Ok(AccountProjection::empty(
+                request.request_id,
+                "expired",
+                "authorization_expired",
+            ));
+        }
+        pending
+    };
+    let Some(browser_url) =
+        browser_authorization_url_for_line(&pending.line_id, &pending.user_code)
+    else {
+        return Ok(AccountProjection::empty(
+            request.request_id,
+            "invalid_response",
+            "invalid_response",
+        ));
+    };
+    let reason = if open_system_browser(&browser_url).is_ok() {
+        "authorization_pending"
+    } else {
+        "browser_open_failed"
+    };
+    Ok(AccountProjection::pending(
+        request.request_id,
+        &pending,
+        reason,
+    ))
+}
+
+fn auth_error(value: &Value) -> (String, u64) {
+    let Some(object) = value.as_object() else {
+        return ("invalid_response".into(), 0);
+    };
+    let code = object
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("invalid_response")
+        .to_owned();
+    let retry = object
+        .get("retry_after")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(60);
+    (code, retry)
+}
+
+#[tauri::command]
+pub async fn account_poll_authorization_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AccountProjection, String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let _poll_guard = _permit
+        .cancel_safe(state.poll_guard.lock())
+        .await
+        .map_err(|_| "assistant_shutting_down")?;
+    let (pending, epoch) = {
+        let runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "account_state_unavailable")?;
+        (runtime.pending.clone(), runtime.authorization_epoch)
+    };
+    let Some(mut pending) = pending.filter(|pending| pending.line_id == request.line_id) else {
+        // Authorization may already have succeeded while account-data loading
+        // failed. Re-inspect the saved session instead of showing signed out.
+        return Ok(match inspect_inner(&state, &request).await {
+            Ok(projection) => projection,
+            Err(error) => failure_projection(request.request_id, error),
+        });
+    };
+    if pending.expires_at_epoch_ms <= now_epoch_ms() {
+        if let Ok(mut runtime) = state.runtime.lock() {
+            if runtime.authorization_epoch == epoch {
+                runtime.pending = None;
+            }
+        }
+        return Ok(AccountProjection::empty(
+            request.request_id,
+            "expired",
+            "authorization_expired",
+        ));
+    }
+    let bootstrap = match fetch_bootstrap(&request.line_id).await {
+        Ok(value) => value,
+        Err(error) => return Ok(failure_projection(request.request_id, error)),
+    };
+    if _permit.is_cancelled() {
+        return Err("assistant_shutting_down".into());
+    }
+    let response = match send_json(
+        Method::POST,
+        &format!("{}{}", bootstrap.origin, TOKEN_PATH),
+        None,
+        Some(json!({"device_code": pending.device_code})),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(failure_projection(
+                request.request_id,
+                AccountProjectionFailure::Transport(error),
+            ))
+        }
+    };
+    if !response.status.is_success() {
+        let (code, retry_after) = auth_error(&response.value);
+        return Ok(match code.as_str() {
+            "authorization_pending" | "slow_down" => {
+                if retry_after > 0 {
+                    pending.poll_after_seconds = retry_after;
+                    if let Ok(mut runtime) = state.runtime.lock() {
+                        if runtime.authorization_epoch == epoch {
+                            runtime.pending = Some(pending.clone());
+                        }
+                    }
+                }
+                let reason = if code == "slow_down" {
+                    "slow_down"
+                } else {
+                    "authorization_pending"
+                };
+                AccountProjection::pending(request.request_id, &pending, reason)
+            }
+            "access_denied" => {
+                if let Ok(mut runtime) = state.runtime.lock() {
+                    if runtime.authorization_epoch == epoch {
+                        runtime.pending = None;
+                    }
+                }
+                AccountProjection::empty(request.request_id, "denied", "authorization_denied")
+            }
+            "expired_token" => {
+                if let Ok(mut runtime) = state.runtime.lock() {
+                    if runtime.authorization_epoch == epoch {
+                        runtime.pending = None;
+                    }
+                }
+                AccountProjection::empty(request.request_id, "expired", "authorization_expired")
+            }
+            "already_used" => {
+                if let Ok(mut runtime) = state.runtime.lock() {
+                    if runtime.authorization_epoch == epoch {
+                        runtime.pending = None;
+                    }
+                }
+                AccountProjection::empty(
+                    request.request_id,
+                    "expired",
+                    "authorization_already_used",
+                )
+            }
+            _ => failure_projection(
+                request.request_id,
+                AccountProjectionFailure::InvalidResponse,
+            ),
+        });
+    }
+    let envelope: DataEnvelope<AuthBundle> = match serde_json::from_value(response.value) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(failure_projection(
+                request.request_id,
+                AccountProjectionFailure::InvalidResponse,
+            ))
+        }
+    };
+    if state
+        .runtime
+        .lock()
+        .map_err(|_| "account_state_unavailable")?
+        .authorization_epoch
+        != epoch
+    {
+        return Ok(AccountProjection::empty(
+            request.request_id,
+            "cancelled",
+            "authorization_cancelled",
+        ));
+    }
+    if !envelope.success {
+        return Ok(failure_projection(
+            request.request_id,
+            AccountProjectionFailure::InvalidResponse,
+        ));
+    }
+    if let Err(failure) = install_auth_bundle(
+        &state,
+        &request.line_id,
+        envelope.data,
+        epoch,
+        Some(&pending.device_code),
+    ) {
+        return Ok(failure_projection(
+            request.request_id,
+            install_failure(failure),
+        ));
+    }
+    match inspect_inner(&state, &request).await {
+        Ok(projection) => Ok(projection),
+        Err(error) => Ok(failure_projection(request.request_id, error)),
+    }
+}
+
+#[tauri::command]
+pub fn account_cancel_authorization_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AccountProjection, String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "account_state_unavailable".to_owned())?;
+    runtime.pending = None;
+    runtime.authorization_epoch += 1;
+    Ok(AccountProjection::empty(
+        request.request_id,
+        "cancelled",
+        "authorization_cancelled",
+    ))
+}
+
+#[tauri::command]
+pub async fn account_logout_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AccountProjection, String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let access = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "account_state_unavailable")?;
+        runtime.authorization_epoch += 1;
+        runtime.pending = None;
+        if delete_stored_session().is_err() {
+            return Ok(failure_projection(
+                request.request_id,
+                AccountProjectionFailure::SecureStorage,
+            ));
+        }
+        runtime.wallet_url = None;
+        runtime.access.take()
+    };
+    for tool in [
+        "claude_code",
+        "claude_desktop",
+        "codex_desktop",
+        "pi",
+        "opencode",
+        "dsh_web",
+        "workbuddy",
+        "dsh_desktop",
+        "cline",
+        "hermes",
+        "openclaw",
+        "cursorpp",
+    ] {
+        crate::request_diagnostics::clear(tool);
+    }
+    if let Some(access) = access {
+        if let Ok(bootstrap) = fetch_bootstrap(&request.line_id).await {
+            let _ = send_json(
+                Method::DELETE,
+                &format!("{}{}", bootstrap.origin, LOGOUT_PATH),
+                Some(&access.access_token),
+                None,
+            )
+            .await;
+        }
+    }
+    Ok(AccountProjection::empty(
+        request.request_id,
+        "signed_out",
+        "logged_out",
+    ))
+}
+
+/// 公告投影。`available` 为 false 时侧边栏不显示入口。
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnouncementsProjection {
+    request_id: String,
+    available: bool,
+    /// 这次是没读到（网络断了、站点出错），不是这个站没有公告栏。界面据此给「再读一次」。
+    missed: bool,
+    notices: Vec<Notice>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notice {
+    id: String,
+    title: String,
+    body: String,
+    severity: &'static str,
+    published_at_epoch_ms: u64,
+    /// 0 when the notice does not expire.
+    expires_at_epoch_ms: u64,
+    /// Also shown as a banner on the home page until the user has seen it.
+    banner: bool,
+    /// The button label, empty when the notice has no button.
+    action_label: String,
+}
+
+/// Where a notice's button goes. Only these two; anything else is dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NoticeTarget {
+    /// The account's own wallet page, the same as 「充值」 everywhere else.
+    Wallet,
+    /// A page on one of our own sites, e.g. the rules of a promotion.
+    Link(String),
+}
+
+const MAX_NOTICES: usize = 30;
+const MAX_NOTICE_TITLE: usize = 120;
+const MAX_NOTICE_BODY: usize = 2000;
+const MAX_NOTICE_ID: usize = 64;
+const MAX_ACTION_LABEL: usize = 16;
+
+/// 只保留可显示的纯文本。公告是服务端自由文本，直接渲染到界面上，
+/// 所以在这里就把控制字符和 bidi 覆盖字符去掉，并限长。
+fn notice_text(raw: Option<&str>, maximum: usize) -> String {
+    raw.unwrap_or_default()
+        .chars()
+        .filter(|c| {
+            (*c == '\n' || !c.is_control())
+                && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(maximum)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn notice_link_url_is_safe(url: &Url, raw: &str) -> bool {
+    raw.len() <= 2048
+        && url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+/// Notice links may only lead to official sites or the connected station host.
+fn notice_link_is_allowed(raw: &str, station_origin: Option<&str>) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    if !notice_link_url_is_safe(&url, raw) {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default();
+    if host == "yeschoy.com" || host.ends_with(".yeschoy.com") || host == "ai.yeschoy.io" {
+        return true;
+    }
+    let Some(origin) = station_origin else {
+        return false;
+    };
+    let Ok(station) = Url::parse(origin) else {
+        return false;
+    };
+    host == station.host_str().unwrap_or_default()
+}
+
+fn notice_target(action: &Value, station_origin: Option<&str>) -> Option<(String, NoticeTarget)> {
+    let label = notice_text(
+        action.get("label").and_then(Value::as_str),
+        MAX_ACTION_LABEL,
+    )
+    .replace('\n', " ");
+    if label.is_empty() {
+        return None;
+    }
+    let target = match action.get("kind").and_then(Value::as_str)? {
+        "wallet" => NoticeTarget::Wallet,
+        "link" => {
+            let url = action.get("url").and_then(Value::as_str)?;
+            if !notice_link_is_allowed(url, station_origin) {
+                return None;
+            }
+            NoticeTarget::Link(url.to_owned())
+        }
+        _ => return None,
+    };
+    Some((label, target))
+}
+
+/// Parse the notices still current at `now`, and what their buttons do.
+fn parse_notices(
+    value: &Value,
+    now: u64,
+    station_origin: Option<&str>,
+) -> (Vec<Notice>, BTreeMap<String, NoticeTarget>) {
+    let mut targets = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let notices = value
+        .get("data")
+        .and_then(|data| data.get("notices"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|notice| {
+            let title = notice_text(
+                notice.get("title").and_then(Value::as_str),
+                MAX_NOTICE_TITLE,
+            );
+            // 没有标题的公告没有任何展示价值，丢掉而不是显示一个空条目。
+            if title.is_empty() {
+                return None;
+            }
+            let expires_at_epoch_ms = notice
+                .get("expiresAtEpochMs")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            // 活动结束了就不再显示，不必等运营去后台撤。
+            if expires_at_epoch_ms != 0 && expires_at_epoch_ms <= now {
+                return None;
+            }
+            // The id is what "already read" is remembered by, so it must be
+            // present and unique; a title stands in for a missing one.
+            let id = Some(notice_text(
+                notice.get("id").and_then(Value::as_str),
+                MAX_NOTICE_ID,
+            ))
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| title.chars().take(MAX_NOTICE_ID).collect());
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            let action = notice
+                .get("action")
+                .and_then(|value| notice_target(value, station_origin));
+            let action_label = match action {
+                Some((label, target)) => {
+                    targets.insert(id.clone(), target);
+                    label
+                }
+                None => String::new(),
+            };
+            Some(Notice {
+                id,
+                title,
+                // `content` is what new-api's own announcements call it, and
+                // what the admin page saves; `body` wins when both are set.
+                body: notice_text(
+                    notice
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .filter(|body| !body.trim().is_empty())
+                        .or_else(|| notice.get("content").and_then(Value::as_str)),
+                    MAX_NOTICE_BODY,
+                ),
+                severity: match notice.get("severity").and_then(Value::as_str) {
+                    Some("warning") => "warning",
+                    _ => "info",
+                },
+                published_at_epoch_ms: notice
+                    .get("publishedAtEpochMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                expires_at_epoch_ms,
+                banner: notice.get("banner").and_then(Value::as_bool) == Some(true),
+                action_label,
+            })
+        })
+        .take(MAX_NOTICES)
+        .collect::<Vec<_>>();
+    targets.retain(|id, _| notices.iter().any(|notice| &notice.id == id));
+    (notices, targets)
+}
+
+/// 读取服务端公告。
+///
+/// 契约（完整说明见 `docs/station-announcements.md` 与 `docs/announcements-contract-zh.md`）：
+/// bootstrap 增加可选字段 `announcements_path`，形如
+/// `/api/desktop/v2/notices`；该路径带会话令牌 GET，返回
+/// `{"success":true,"data":{"notices":[
+///   {"id":"...","title":"...","body":"...","severity":"info|warning",
+///    "publishedAtEpochMs":1758000000000,
+///    "expiresAtEpochMs":0, "banner":false,
+///    "action":{"kind":"wallet|link","label":"去充值","url":"https://..."}}]}}`
+///
+/// 服务端没宣告这个字段时返回 `available: false`，界面不显示入口 ——
+/// 客户端和服务端谁先发布都不会出错。读取失败同样只是没有公告，
+/// 绝不影响登录或接入。
+#[tauri::command]
+pub async fn account_announcements_read_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<AnnouncementsProjection, String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    let unavailable = AnnouncementsProjection {
+        request_id: request.request_id.clone(),
+        ..Default::default()
+    };
+    let missed = || AnnouncementsProjection {
+        request_id: request.request_id.clone(),
+        missed: true,
+        ..Default::default()
+    };
+    let bootstrap = match fetch_bootstrap(&request.line_id).await {
+        Ok(bootstrap) => bootstrap,
+        // 连不上、网关出错才算这次没读到；站点好好答了却不是我们认识的那种，就是没有公告栏。
+        Err(AccountProjectionFailure::Transport(failure)) if worth_rereading(&failure) => {
+            return Ok(missed())
+        }
+        Err(_) => return Ok(unavailable),
+    };
+    if bootstrap.announcements_path.is_empty() {
+        return Ok(unavailable);
+    }
+    let Ok(epoch) = native_session_epoch(&state) else {
+        return Ok(unavailable);
+    };
+    let Ok((origin, access_token)) = native_session_access(&state, &request.line_id, epoch).await
+    else {
+        return Ok(unavailable);
+    };
+    let url = format!("{origin}{}", bootstrap.announcements_path);
+    let response = match send_json(Method::GET, &url, Some(&access_token), None).await {
+        Ok(response) => response,
+        Err(failure) if worth_rereading(&failure) => return Ok(missed()),
+        Err(_) => return Ok(unavailable),
+    };
+    if !response.status.is_success() {
+        log::info!(
+            "account stage=announcements_unavailable http={}",
+            response.status.as_u16()
+        );
+        return Ok(if passing_trouble(response.status.as_u16()) {
+            missed()
+        } else {
+            unavailable
+        });
+    }
+    let (notices, actions) = parse_notices(&response.value, now_epoch_ms(), Some(&origin));
+    if let Ok(mut runtime) = state.runtime.lock() {
+        runtime.announcement_actions = actions;
+    }
+    Ok(AnnouncementsProjection {
+        request_id: request.request_id,
+        available: true,
+        missed: false,
+        notices,
+    })
+}
+
+/// 这次没读到、等下再读多半就好：断网、超时，或者网关答了一页出错页。
+/// 站点好好地答了一页网页（没有桌面接口的站点就是这样答的）不算，那是没有公告栏。
+fn worth_rereading(failure: &TransportFailure) -> bool {
+    matches!(
+        failure,
+        TransportFailure::Network | TransportFailure::TimedOut | TransportFailure::Unwell
+    )
+}
+
+/// 「太忙」或「出错了」那一类状态码：是这一下的事，不是这个站没有这个地址。
+fn passing_trouble(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnnouncementActionRequest {
+    request_id: String,
+    line_id: String,
+    notice_id: String,
+}
+
+/// Follow a notice's button. The renderer names the notice; where it leads
+/// comes from the last read, so a page can never ask to open an arbitrary URL.
+#[tauri::command]
+pub async fn account_announcement_action_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AnnouncementActionRequest,
+) -> Result<(), String> {
+    let account = AccountRequest {
+        request_id: request.request_id,
+        line_id: request.line_id,
+    };
+    if !request_is_valid(&account) || request.notice_id.len() > MAX_NOTICE_ID * 4 {
+        return Err("invalid_account_request".into());
+    }
+    let target = state
+        .runtime
+        .lock()
+        .map_err(|_| "announcement_action_unavailable".to_owned())?
+        .announcement_actions
+        .get(&request.notice_id)
+        .cloned()
+        .ok_or_else(|| "announcement_action_unavailable".to_owned())?;
+    match target {
+        NoticeTarget::Wallet => open_wallet(&state, &account.line_id).await,
+        NoticeTarget::Link(url) => {
+            let station_origin = account_line_origin(&account.line_id);
+            if !notice_link_is_allowed(&url, station_origin.as_deref()) {
+                return Err("announcement_action_unavailable".into());
+            }
+            open_system_browser(&url).map_err(|_| "browser_open_failed".to_owned())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn account_open_wallet_v2(
+    state: tauri::State<'_, AccountV2State>,
+    request: AccountRequest,
+) -> Result<(), String> {
+    if !request_is_valid(&request) {
+        return Err("invalid_account_request".into());
+    }
+    open_wallet(&state, &request.line_id).await
+}
+
+async fn open_wallet(state: &AccountV2State, line_id: &str) -> Result<(), String> {
+    let _permit = crate::shutdown_coordinator::global()
+        .admit_operation()
+        .map_err(|_| "assistant_shutting_down")?;
+    let bootstrap = fetch_bootstrap(line_id)
+        .await
+        .map_err(|_| "wallet_unavailable".to_owned())?;
+    let stored = state
+        .runtime
+        .lock()
+        .map_err(|_| "wallet_unavailable".to_owned())?
+        .wallet_url
+        .clone();
+    let wallet = stored
+        .filter(|value| value == &bootstrap.wallet_url)
+        .unwrap_or(bootstrap.wallet_url);
+    let api_origin = account_line_origin(line_id).ok_or("wallet_unavailable")?;
+    if !wallet_page_is_allowed(&bootstrap.dialect, &wallet, &api_origin) {
+        return Err("wallet_unavailable".into());
+    }
+    if _permit.is_cancelled() {
+        return Err("assistant_shutting_down".into());
+    }
+    open_system_browser(&wallet).map_err(|_| "browser_open_failed".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inspect_deadline_stays_short_so_home_never_waits_a_minute() {
+        assert!(INSPECT_DEADLINE <= std::time::Duration::from_secs(5));
+        assert!(CONNECT_TIMEOUT <= std::time::Duration::from_secs(2));
+        assert!(REQUEST_TIMEOUT <= std::time::Duration::from_secs(10));
+    }
+
+    use super::*;
+
+    #[test]
+    fn device_name_sanitizer_strips_control_chars_and_caps_length() {
+        assert_eq!(
+            sanitize_device_name("MacBook-Pro.local"),
+            Some("MacBook-Pro.local".into())
+        );
+        assert_eq!(
+            sanitize_device_name("  spaced \n host \n"),
+            Some("spaced  host".into())
+        );
+        assert_eq!(sanitize_device_name("\u{1}\u{2}\u{7f}"), None);
+        assert_eq!(sanitize_device_name("   "), None);
+        assert_eq!(sanitize_device_name(""), None);
+        let long = "a".repeat(100);
+        assert_eq!(
+            sanitize_device_name(&long).map(|v| v.chars().count()),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn account_schema_four_omits_unknown_prices_but_keeps_zero() {
+        let projection =
+            AccountProjection::empty("account-test".into(), "signed_out", "signed_out");
+        assert_eq!(
+            serde_json::to_value(projection).unwrap()["schemaVersion"],
+            6
+        );
+        let billing = ModelBilling {
+            groups: vec![BillingGroup {
+                plan: None,
+                id: "default".into(),
+                description: String::new(),
+                ratio: None,
+                supported_endpoint_types: Vec::new(),
+            }],
+            base_input_usd: Some(0.0),
+            base_output_usd: Some(2.0),
+            cache_read_usd: Some(0.0),
+            cache_write_usd: None,
+            request_usd: None,
+            expression: String::new(),
+        };
+        let value = serde_json::to_value(billing).unwrap();
+        assert_eq!(value["baseInputUsd"], 0.0);
+        assert_eq!(value["cacheReadUsd"], 0.0);
+        assert!(value.get("cacheWriteUsd").is_none());
+        assert!(value.get("requestUsd").is_none());
+        assert!(value["groups"][0].get("ratio").is_none());
+    }
+
+    #[test]
+    fn cancelled_authorization_cannot_install_late_credentials() {
+        // Both branches reject before any OS credential storage operation.
+        let state = AccountV2State::default();
+        state.runtime.lock().unwrap().authorization_epoch = 2;
+        let bundle = || AuthBundle {
+            access_token: "synthetic".into(),
+            token_type: "Bearer".into(),
+            access_expires_at: 0,
+            refresh_token: "synthetic".into(),
+            refresh_expires_at: 0,
+            session_id: "synthetic".into(),
+        };
+        assert!(install_auth_bundle(&state, "mainland_optimized", bundle(), 1, None).is_err());
+        assert!(install_auth_bundle(
+            &state,
+            "mainland_optimized",
+            bundle(),
+            2,
+            Some("old-device-code")
+        )
+        .is_err());
+        assert!(state.runtime.lock().unwrap().access.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_switch_before_session_step_never_polls_new_account_work() {
+        let state = AccountV2State::default();
+        let epoch = native_session_epoch(&state).unwrap();
+        state.runtime.lock().unwrap().authorization_epoch += 1;
+        let called = std::cell::Cell::new(false);
+        let result = session_bound_step(&state, epoch, async {
+            called.set(true);
+            Ok("new-account-credential")
+        })
+        .await;
+        assert_eq!(result, Err(NativeSessionFailure::AccountChanged));
+        assert!(!called.get());
+    }
+
+    #[tokio::test]
+    async fn account_switch_during_session_step_cannot_reach_tool_token_or_write() {
+        let state = AccountV2State::default();
+        let epoch = native_session_epoch(&state).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let step = session_bound_step(&state, epoch, async {
+            started_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            Ok("synthetic-new-account-credential")
+        });
+        let switch = async {
+            started_rx.await.unwrap();
+            state.runtime.lock().unwrap().authorization_epoch += 1;
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(step, switch);
+        assert_eq!(result, Err(NativeSessionFailure::AccountChanged));
+        assert_eq!(
+            ensure_session_epoch(&state, epoch),
+            Err(NativeSessionFailure::AccountChanged)
+        );
+    }
+
+    #[test]
+    fn request_and_url_allowlists_reject_caller_controlled_network_targets() {
+        assert!(request_is_valid(&AccountRequest {
+            request_id: "account-1".into(),
+            line_id: "mainland_optimized".into(),
+        }));
+        assert!(!request_is_valid(&AccountRequest {
+            request_id: "../secret".into(),
+            line_id: "mainland_optimized".into(),
+        }));
+        assert!(!request_is_valid(&AccountRequest {
+            request_id: "account-1".into(),
+            line_id: "https://attacker.invalid".into(),
+        }));
+        assert!(wallet_url_is_allowed(
+            "https://yeschoy.com/wallet/",
+            "https://yeschoy.com"
+        ));
+        assert!(wallet_url_is_allowed(
+            "https://connect.localtest.me/wallet/",
+            "https://connect.localtest.me"
+        ));
+        assert!(!wallet_url_is_allowed(
+            "https://yeschoy.com.attacker.invalid/wallet/",
+            "https://yeschoy.com"
+        ));
+        assert!(!wallet_url_is_allowed(
+            "https://yeschoy.com/wallet/?next=https://attacker.invalid",
+            "https://yeschoy.com"
+        ));
+        assert!(!wallet_url_is_allowed(
+            "https://evil.example/wallet/",
+            "https://connect.localtest.me"
+        ));
+        assert!(authorization_url_is_allowed(
+            "https://yeschoy.com/desktop-authorize?user_code=ABCD-2345",
+            "ABCD-2345"
+        ));
+        assert!(!authorization_url_is_allowed(
+            "https://yeschoy.com/desktop-authorize?user_code=ABCD-2345&next=x",
+            "ABCD-2345"
+        ));
+    }
+
+    #[test]
+    fn a_saved_browser_login_to_a_refused_station_is_no_longer_a_line() {
+        for line in [
+            "station_connect:https://open-design.ai",
+            "station_connect:https://api.open-design.ai",
+        ] {
+            assert_eq!(station_connect_origin_from_line_id(line), None, "{line}");
+            assert_eq!(account_line_origin(line), None, "{line}");
+            assert!(!account_request_line_id_is_valid(line), "{line}");
+            assert!(!persisted_session_line_id(line), "{line}");
+        }
+        assert!(persisted_session_line_id(
+            "station_connect:https://not-open-design.ai"
+        ));
+        // 存下的登录靠这个判断整份丢掉；别的站点、内置线路、认不出的旧线路都不丢。
+        assert!(line_is_refused_station(
+            "station_connect:https://API.Open-Design.ai"
+        ));
+        assert!(line_is_refused_station(
+            "station_key:https://open-design.ai"
+        ));
+        for kept in [
+            "station_connect:https://not-open-design.ai",
+            "station_connect:not a url",
+            "station_key:https://example.com",
+            "mainland_optimized",
+            "",
+        ] {
+            assert!(!line_is_refused_station(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn app_token_header_must_be_a_plain_custom_header() {
+        assert!(app_token_header_is_allowed("X-Desktop-App-Token"));
+        assert!(app_token_header_is_allowed("x-yeschoy-app-token"));
+
+        assert!(!app_token_header_is_allowed("Authorization"));
+        assert!(!app_token_header_is_allowed("x-api-key"));
+        assert!(!app_token_header_is_allowed("X-"));
+        assert!(!app_token_header_is_allowed("X-Bad Name"));
+        // A multi-byte character across the prefix must be refused, not panic.
+        assert!(!app_token_header_is_allowed("x€-token"));
+        assert!(!app_token_header_is_allowed("é-token"));
+    }
+
+    #[test]
+    fn a_session_serves_only_its_own_station() {
+        let station = "station_connect:https://example.com";
+        assert!(session_serves_line(
+            "mainland_optimized",
+            "global_accelerated"
+        ));
+        assert!(session_serves_line("", "mainland_optimized"));
+        assert!(session_serves_line(station, station));
+        assert!(!session_serves_line("mainland_optimized", station));
+        assert!(!session_serves_line(station, "mainland_optimized"));
+        assert!(!session_serves_line(
+            station,
+            "station_connect:https://other.example"
+        ));
+        assert!(!session_serves_line("", station));
+    }
+
+    #[test]
+    fn station_connect_line_id_maps_catalog_and_synthetic_origins() {
+        assert_eq!(
+            line_id_for_station_connect_origin("https://yeschoy.com"),
+            "mainland_optimized"
+        );
+        assert_eq!(
+            line_id_for_station_connect_origin("https://example.com"),
+            "station_connect:https://example.com"
+        );
+        assert_eq!(
+            station_connect_origin_from_line_id("station_connect:https://example.com"),
+            Some("https://example.com")
+        );
+        assert!(account_request_line_id_is_valid(
+            "station_connect:https://example.com"
+        ));
+        assert_eq!(
+            account_line_origin("station_connect:https://example.com"),
+            Some("https://example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn authorization_page_origin_is_compile_time_and_exactly_allowlisted() {
+        assert!(authorization_page_origin_is_allowed(
+            CANONICAL_AUTHORIZATION_PAGE_ORIGIN
+        ));
+        assert!(authorization_page_origin_is_allowed(
+            PARTNER_AUTHORIZATION_PAGE_ORIGIN
+        ));
+        assert!(authorization_page_origin_is_allowed(
+            COMPILED_AUTHORIZATION_PAGE_ORIGIN
+        ));
+        for rejected in [
+            "http://yeschoy.com",
+            "https://yeschoy.com/desktop-authorize",
+            "https://yeschoy.com?next=https://attacker.invalid",
+            "https://ai.yeschoy.io:443",
+            "https://user@ai.yeschoy.io",
+            "https://ai.yeschoy.io.attacker.invalid",
+            "https://attacker.invalid",
+        ] {
+            assert!(!authorization_page_origin_is_allowed(rejected));
+        }
+    }
+
+    #[test]
+    fn account_projection_preserves_negative_balance_and_rejects_negative_counters() {
+        let status = json!({
+            "success": true,
+            "data": {"quota_per_unit": 500000}
+        });
+        let account = json!({
+            "success": true,
+            "data": {
+                "display_name": "欠费账户",
+                "username": "member@example.com",
+                "quota": -125000,
+                "used_quota": 120000,
+                "request_count": 42
+            }
+        });
+
+        let projected = parse_account(Some(&account), Some(&status));
+        assert!(projected.available);
+        assert_eq!(projected.balance_quota, "-125000");
+        assert_eq!(projected.quota_per_unit, "500000");
+
+        // A malformed counter is display-only. It must never reach the
+        // renderer, but it must not cost the user the whole sign-in either:
+        // that is how an approved authorization still reads as "waiting".
+        for field in ["used_quota", "request_count"] {
+            for malformed in [json!(-1), Value::Null, json!("42")] {
+                let mut invalid = account.clone();
+                invalid["data"][field] = malformed.clone();
+                let projected = parse_account(Some(&invalid), Some(&status));
+                assert!(projected.available, "{field} {malformed}");
+                let rendered = if field == "used_quota" {
+                    &projected.used_quota
+                } else {
+                    &projected.request_count
+                };
+                assert_eq!(
+                    rendered, "",
+                    "{field} renders as unknown, never {malformed}"
+                );
+            }
+        }
+
+        // The balance is the one load-bearing field: without it there is no
+        // account to show, so this one still fails closed.
+        let mut no_balance = account.clone();
+        no_balance["data"]["quota"] = Value::Null;
+        assert!(!parse_account(Some(&no_balance), Some(&status)).available);
+    }
+
+    #[test]
+    fn account_projection_survives_a_brand_new_account_without_counters() {
+        let account = json!({"success": true, "data": {"quota": 1000}});
+        let projected = parse_account(Some(&account), None);
+        assert!(
+            projected.available,
+            "an account that has made no requests can still sign in"
+        );
+        assert_eq!(projected.balance_quota, "1000");
+        assert_eq!(projected.request_count, "");
+        assert_eq!(projected.used_quota, "");
+    }
+
+    #[test]
+    fn money_survives_a_missing_or_negative_used_quota() {
+        // The full path the billing page depends on: `parse_account` lets the
+        // counter through as "", and `account_money` must then still convert
+        // the balance. Before, the "" made the whole money computation fail
+        // and the page told the user to refresh — which could not help.
+        let status = json!({
+            "success": true,
+            "data": {"quota_display_type": "CNY", "quota_per_unit": 500000, "usd_exchange_rate": 7}
+        });
+        let absent = json!({"success": true, "data": {"quota": 500000}});
+        let negative = json!({"success": true, "data": {"quota": 500000, "used_quota": -1}});
+        for account in [absent, negative] {
+            let projected = parse_account(Some(&account), Some(&status));
+            assert!(projected.available, "{account}");
+            assert_eq!(projected.used_quota, "", "{account}");
+            let money = account_money(
+                Some(&status),
+                &projected.balance_quota,
+                &projected.used_quota,
+            );
+            assert_eq!(money.currency, "CNY", "{account}");
+            assert_eq!(money.balance_amount, "7", "{account}");
+            assert_eq!(money.consumed_amount, "", "{account}");
+        }
+    }
+
+    #[test]
+    fn install_failures_separate_contract_from_credential_storage() {
+        // These two used to collapse into one projection, which sent every
+        // "cannot sign in" report at the OS keychain regardless of cause.
+        assert!(matches!(
+            install_failure(InstallFailure::Contract),
+            AccountProjectionFailure::InvalidResponse
+        ));
+        assert!(matches!(
+            install_failure(InstallFailure::Storage),
+            AccountProjectionFailure::SecureStorage
+        ));
+    }
+
+    #[test]
+    fn branded_authorization_url_is_rebuilt_from_validated_user_code_only() {
+        assert_eq!(
+            browser_authorization_url_for_origin(CANONICAL_AUTHORIZATION_PAGE_ORIGIN, "ABCD-2345")
+                .as_deref(),
+            Some("https://yeschoy.com/desktop-authorize?user_code=ABCD-2345")
+        );
+        assert_eq!(
+            browser_authorization_url_for_origin(PARTNER_AUTHORIZATION_PAGE_ORIGIN, "ABCD-2345")
+                .as_deref(),
+            Some("https://ai.yeschoy.io/desktop-authorize?user_code=ABCD-2345")
+        );
+        assert!(browser_authorization_url_for_origin(
+            PARTNER_AUTHORIZATION_PAGE_ORIGIN,
+            "unsafe&next=https://attacker.invalid"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compiled_authorization_page_origin_drives_the_browser_target() {
+        assert_eq!(
+            browser_authorization_url("ABCD-2345"),
+            Some(format!(
+                "{COMPILED_AUTHORIZATION_PAGE_ORIGIN}/desktop-authorize?user_code=ABCD-2345"
+            ))
+        );
+    }
+
+    #[test]
+    fn multiline_billing_rules_survive_model_projection() {
+        let ids = ["deepseek-v4-flash", "deepseek-v4.1-flash"];
+        let models = json!({"success":true,"data":ids});
+        let account = json!({"success":true,"data":{"group":"default"}});
+        let rule = "weekday(\"Asia/Shanghai\") >= 1\n\t? tier(\"高峰期\", p * 2 + cr * 0.04 + c * 8)\r\n: tier(\"非高峰期\", p + cr * 0.02 + c * 4)";
+        let pricing = json!({"success":true,"group_ratio":{"default":0.35},
+            "usable_group":{"default":"标准分组"},
+            "data":ids.map(|id| json!({"model_name":id,"billing_mode":"tiered_expr",
+                "billing_expr":rule,"enable_groups":["default"]}))});
+        let projected = parse_models(Some(&models), Some(&pricing), Some(&account), Some(1.0));
+        assert_eq!(projected.len(), 2);
+        for model in projected {
+            assert_eq!(
+                model.billing.unwrap().expression,
+                rule.replace(['\n', '\r', '\t'], " ")
+            );
+        }
+        assert!(bounded_text(Some(&json!(rule)), 8192).is_empty());
+    }
+
+    #[test]
+    fn billing_rule_normalization_keeps_text_security_checks() {
+        for text in ["p + c\u{001b}", "p + c\u{202e}", "tier(\"a\nb\", p + c)"] {
+            assert!(billing_expression(Some(&json!(text))).is_empty());
+        }
+        assert!(billing_expression(Some(&json!(" ".repeat(8193)))).is_empty());
+        let quoted = r#"tier("escaped \" quote", p + c)"#;
+        assert_eq!(billing_expression(Some(&json!(quoted))), quoted);
+    }
+
+    #[test]
+    fn price_projection_is_ratio_based_and_never_prices_unsupported_rows() {
+        let models = json!({"success": true, "data": ["model-a", "model-b"]});
+        let account = json!({"success": true, "data": {"group": "default"}});
+        let pricing = json!({
+            "success": true,
+            "group_ratio": {"default": 0.5},
+            "data": [
+                {"model_name": "model-a", "quota_type": 0, "model_ratio": 1.0, "completion_ratio": 3.0},
+                {"model_name": "model-b", "quota_type": 1, "model_price": 0.1}
+            ]
+        });
+        let rows = parse_models(Some(&models), Some(&pricing), Some(&account), Some(7.0));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].pricing_available);
+        assert_eq!(rows[0].official_input_cny_per_million, "14");
+        assert_eq!(rows[0].actual_input_cny_per_million, "7");
+        assert!(!rows[1].pricing_available);
+        assert!(rows[1].official_input_cny_per_million.is_empty());
+    }
+
+    #[test]
+    fn model_projection_omits_internal_descriptions_without_changing_prices() {
+        let models = json!({"success":true,"data":["claude-haiku-4-5"]});
+        let account = json!({"success":true,"data":{"group":"default"}});
+        let mut pricing = json!({"success":true,"group_ratio":{"default":0.5},
+        "usable_group":{"default":"标准分组"},"data":[{
+            "model_name":"claude-haiku-4-5","description":"Synthetic upstream via internal connector",
+            "quota_type":0,"model_ratio":1.0,"completion_ratio":3.0,
+            "enable_groups":["default"],"supported_endpoint_types":["anthropic"]
+        }]});
+        let projected = parse_models(Some(&models), Some(&pricing), Some(&account), Some(1.0));
+        assert_eq!(projected[0].id, "claude-haiku-4-5");
+        assert!(projected[0].description.is_empty());
+        assert_eq!(projected[0].actual_input_cny_per_million, "1");
+        assert_eq!(
+            projected[0].billing.as_ref().unwrap().groups[0].description,
+            "标准分组"
+        );
+        let serialized = serde_json::to_value(&projected).unwrap();
+        assert!(!serialized.to_string().contains("Synthetic upstream"));
+        pricing["data"][0]["description"] = json!("A different private channel label");
+        assert_eq!(
+            serialized,
+            serde_json::to_value(parse_models(
+                Some(&models),
+                Some(&pricing),
+                Some(&account),
+                Some(1.0)
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn billing_group_intersection_keeps_zero_and_unknown_prices_without_guessing() {
+        let pricing = json!({"success": true,
+            "usable_group": {"default": "", "special": "账户专属", "free": "", "unpriced": "", "other": "", "auto": ""},
+            "group_ratio": {"default": 1, "special": 0.35, "free": 0, "private": 0.1},
+            "data": [{"model_name": "m", "enable_groups": ["default", "special", "free", "unpriced", "private", "auto"]}]
+        });
+        let groups = billing_groups(&pricing, "m");
+        assert_eq!(
+            groups.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+            ["default", "free", "special", "unpriced"]
+        );
+        assert_eq!(
+            groups.iter().find(|g| g.id == "free").unwrap().ratio,
+            Some(0.0)
+        );
+        assert_eq!(
+            groups.iter().find(|g| g.id == "special").unwrap().ratio,
+            Some(0.35)
+        );
+        assert_eq!(
+            groups.iter().find(|g| g.id == "unpriced").unwrap().ratio,
+            None
+        );
+        assert!(billing_groups(&pricing, "missing-model").is_empty());
+        assert!(billing_groups(&json!({"success": false}), "m").is_empty());
+    }
+
+    #[test]
+    fn endpoint_types_union_across_channel_rows_and_split_per_billing_group() {
+        let models = json!({"success":true,"data":["deepseek-v4.1-flash"]});
+        let pricing = json!({
+            "success": true,
+            "usable_group": {"标准方案": "chat", "gptpro": "responses"},
+            "group_ratio": {"标准方案": 1, "gptpro": 0.7},
+            "data": [
+                {
+                    "model_name": "deepseek-v4.1-flash",
+                    "enable_groups": ["标准方案"],
+                    "supported_endpoint_types": ["openai"],
+                    "quota_type": 0,
+                    "model_ratio": 1.0,
+                    "completion_ratio": 1.0
+                },
+                {
+                    "model_name": "deepseek-v4.1-flash",
+                    "enable_groups": ["gptpro"],
+                    "supported_endpoint_types": ["openai-response"]
+                }
+            ]
+        });
+        let projected = parse_models(Some(&models), Some(&pricing), None, Some(1.0));
+        // 这个字段是 Option：None 表示中转什么都没说（模型不在价目表里），
+        // 和「声明了空列表」不是一回事。合并时这条断言还是旧的 Vec 类型，
+        // 导致合并点的 cargo test 编不过。
+        assert_eq!(
+            projected[0].supported_endpoint_types,
+            Some(vec!["openai".to_string(), "openai-response".to_string()])
+        );
+        let groups = &projected[0].billing.as_ref().unwrap().groups;
+        let chat = groups.iter().find(|g| g.id == "标准方案").unwrap();
+        let responses = groups.iter().find(|g| g.id == "gptpro").unwrap();
+        assert_eq!(chat.supported_endpoint_types, vec!["openai".to_string()]);
+        assert_eq!(
+            responses.supported_endpoint_types,
+            vec!["openai-response".to_string()]
+        );
+    }
+
+    #[test]
+    fn dynamic_billing_metadata_is_projected_without_claiming_flat_prices() {
+        let pricing = json!({"success": true, "usable_group": {"discount": ""}, "group_ratio": {"discount": 0.35},
+            "data": [{"model_name":"m", "enable_groups":["discount"], "billing_mode":"tiered_expr",
+                "model_ratio":0.11,"completion_ratio":3,"billing_expr":"tier(\"base\", p * 3 + c * 9)"}]});
+        let models = json!({"success":true,"data":["m"]});
+        let projected = parse_models(Some(&models), Some(&pricing), None, Some(7.0));
+        assert!(!projected[0].pricing_available);
+        let billing = projected[0].billing.as_ref().unwrap();
+        assert_eq!(billing.groups[0].ratio, Some(0.35));
+        assert_eq!(billing.expression, "tier(\"base\", p * 3 + c * 9)");
+    }
+
+    #[test]
+    fn projection_serialization_contains_no_secret_fields() {
+        let projection = AccountProjection::empty("safe".into(), "signed_out", "signed_out");
+        let value = serde_json::to_value(projection).unwrap();
+        let serialized = value.to_string();
+        for forbidden in [
+            "accessToken",
+            "refreshToken",
+            "sessionId",
+            "deviceCode",
+            "walletUrl",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+    #[test]
+    fn announcements_tell_a_missed_read_from_a_station_without_a_board() {
+        // 太忙、出错：等下再读。没有这个地址、不让看：这个站就是没有公告栏。
+        for status in [408, 429, 500, 502, 503] {
+            assert!(passing_trouble(status), "{status}");
+        }
+        for status in [400, 401, 403, 404] {
+            assert!(!passing_trouble(status), "{status}");
+        }
+        // 没有桌面接口的站点对那个地址答的是一页网页：不是没读到，是没有公告栏。
+        assert!(worth_rereading(&TransportFailure::Network));
+        assert!(worth_rereading(&TransportFailure::TimedOut));
+        // 网关答的出错页（502 之类，不是 JSON）是这一下的事，要给「再读一次」。
+        assert!(worth_rereading(&not_json(502)));
+        assert!(!worth_rereading(&not_json(404)));
+        assert!(!worth_rereading(&not_json(200)));
+        assert!(!worth_rereading(&TransportFailure::ResponseTooLarge));
+        let row = serde_json::to_value(AnnouncementsProjection {
+            missed: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            (&row["available"], &row["missed"]),
+            (&json!(false), &json!(true))
+        );
+    }
+
+    #[test]
+    fn notices_carry_only_safe_buttons_and_drop_what_has_ended() {
+        let payload = json!({"success": true, "data": {"notices": [
+            {"id": "recharge-1001", "title": "国庆充值加赠", "body": "充 100 送 20",
+             "severity": "warning", "banner": true, "expiresAtEpochMs": 2_000,
+             "action": {"kind": "wallet", "label": "去充值"}},
+            {"id": "rules", "title": "活动细则",
+             "action": {"kind": "link", "label": "查看", "url": "https://yeschoy.com/events/1001"}},
+            {"id": "phish", "title": "钓鱼",
+             "action": {"kind": "link", "label": "点我", "url": "https://yeschoy.com.evil.example/x"}},
+            {"id": "plain-http", "title": "明文",
+             "action": {"kind": "link", "label": "点我", "url": "http://yeschoy.com/x"}},
+            {"id": "script", "title": "脚本",
+             "action": {"kind": "link", "label": "点我", "url": "javascript:alert(1)"}},
+            {"id": "unknown-kind", "title": "未知按钮",
+             "action": {"kind": "launch", "label": "运行"}},
+            {"id": "ended", "title": "已结束的活动", "expiresAtEpochMs": 999},
+            {"id": "recharge-1001", "title": "重复的 id"},
+            {"title": "没有 id 的公告"}
+        ]}});
+        let (notices, targets) = parse_notices(&payload, 1_000, Some("https://yeschoy.com"));
+        let ids = notices.iter().map(|n| n.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "recharge-1001",
+                "rules",
+                "phish",
+                "plain-http",
+                "script",
+                "unknown-kind",
+                "没有 id 的公告"
+            ]
+        );
+        assert!(notices[0].banner);
+        assert_eq!(notices[0].expires_at_epoch_ms, 2_000);
+        assert_eq!(notices[0].action_label, "去充值");
+        assert_eq!(targets.get("recharge-1001"), Some(&NoticeTarget::Wallet));
+        assert_eq!(
+            targets.get("rules"),
+            Some(&NoticeTarget::Link(
+                "https://yeschoy.com/events/1001".into()
+            ))
+        );
+        for refused in ["phish", "plain-http", "script", "unknown-kind"] {
+            assert!(!targets.contains_key(refused), "{refused}");
+            let notice = notices.iter().find(|n| n.id == refused).unwrap();
+            assert!(notice.action_label.is_empty(), "{refused}");
+        }
+        assert!(!notices[1].banner);
+    }
+
+    #[test]
+    fn notice_links_stay_on_official_or_connected_station() {
+        let station = Some("https://connect.localtest.me");
+        for allowed in [
+            "https://yeschoy.com/events",
+            "https://www.yeschoy.com/a?b=c#d",
+            "https://ai.yeschoy.io/promo",
+            "https://connect.localtest.me/events/2026",
+        ] {
+            assert!(notice_link_is_allowed(allowed, station), "{allowed}");
+        }
+        for refused in [
+            "http://yeschoy.com/events",
+            "https://yeschoy.com:8443/events",
+            "https://user:pass@yeschoy.com/",
+            "https://evilyeschoy.com/",
+            "https://yeschoy.io/",
+            "https://evil.example/phish",
+            "file:///etc/passwd",
+        ] {
+            assert!(!notice_link_is_allowed(refused, station), "{refused}");
+        }
+        assert!(!notice_link_is_allowed(
+            "https://connect.localtest.me/page",
+            None
+        ));
+    }
+
+    #[test]
+    fn relative_api_path_rejects_absolute_and_traversal() {
+        assert_eq!(
+            relative_api_path("/api/desktop/v2/notices"),
+            Some("/api/desktop/v2/notices".into())
+        );
+        assert_eq!(relative_api_path(""), None);
+        assert_eq!(relative_api_path("https://evil.example/x"), None);
+        assert_eq!(relative_api_path("//evil.example/x"), None);
+        assert_eq!(relative_api_path("/api/../notices"), None);
+    }
+    #[test]
+    fn notice_text_may_arrive_as_content() {
+        let payload = json!({"data": {"notices": [
+            {"id": "a", "title": "只有 content", "content": "国庆**双重福利**"},
+            {"id": "b", "title": "两个都有", "body": "正文", "content": "旧字段"},
+            {"id": "c", "title": "body 是空的", "body": " ", "content": "用 content"}
+        ]}});
+        let (notices, _) = parse_notices(&payload, 0, None);
+        let bodies = notices.iter().map(|n| n.body.as_str()).collect::<Vec<_>>();
+        assert_eq!(bodies, ["国庆**双重福利**", "正文", "用 content"]);
+    }
+}
+
+#[cfg(test)]
+mod third_party_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_station_line_has_no_authorization_page() {
+        let line = format!("{STATION_CONNECT_LINE_PREFIX}https://untrusted-auth.example");
+        assert!(authorization_page_origin_for_line(&line).is_none());
+        assert!(browser_authorization_url_for_line(&line, "ABCD-2345").is_none());
+    }
+
+    #[test]
+    fn trusted_station_line_uses_its_own_origin_only() {
+        crate::station_trust::trust("https://trusted-auth.example").unwrap();
+        let line = format!("{STATION_CONNECT_LINE_PREFIX}https://trusted-auth.example");
+        assert_eq!(
+            browser_authorization_url_for_line(&line, "ABCD-2345").as_deref(),
+            Some("https://trusted-auth.example/desktop-authorize?user_code=ABCD-2345")
+        );
+        let origin = authorization_page_origin_for_line(&line).unwrap();
+        assert!(authorization_url_is_allowed_for(
+            "https://trusted-auth.example/desktop-authorize?user_code=ABCD-2345",
+            "ABCD-2345",
+            &origin
+        ));
+        assert!(!authorization_url_is_allowed_for(
+            "https://evil.example/desktop-authorize?user_code=ABCD-2345",
+            "ABCD-2345",
+            &origin
+        ));
+        crate::station_trust::forget("https://trusted-auth.example");
+    }
+
+    #[test]
+    fn builtin_lines_keep_compiled_origin() {
+        let line = CONNECTIVITY_LINES[0].line_id;
+        assert_eq!(
+            authorization_page_origin_for_line(line).as_deref(),
+            Some(COMPILED_AUTHORIZATION_PAGE_ORIGIN)
+        );
+    }
+}

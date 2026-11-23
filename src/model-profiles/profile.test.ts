@@ -1,0 +1,260 @@
+import { describe, expect, it } from "vitest";
+import {
+  hasReviewedCapabilities,
+  modelCapabilities,
+  modelDisplayName,
+  modelMatchesQuery,
+} from "./profile";
+
+describe("model search normalization does not change model identity", () => {
+  it.each(["gpt6", "gpt 6", "GPT-6 Astra", "ＧＰＴ　６", "gpt—6", "astra gpt"])(
+    "matches the reviewed ID or label with query %s",
+    (query) => expect(modelMatchesQuery("gpt-6-astra", query)).toBe(true),
+  );
+  it.each(["deepseek v4", "DeepSeek_V4_Flash", "claude 4.6", "gpt 5.6 sol"])(
+    "allows separators without requiring exact API punctuation: %s",
+    (query) => {
+      const id = query.toLowerCase().startsWith("deepseek")
+        ? "deepseek-v4-flash"
+        : query.startsWith("claude")
+          ? "claude-sonnet-4-6"
+          : "gpt-5.6-sol";
+      expect(modelMatchesQuery(id, query)).toBe(true);
+    },
+  );
+  it("requires every search term and handles empty or punctuation-only input", () => {
+    expect(modelMatchesQuery("gpt-6-astra", "gpt nonexistent")).toBe(false);
+    expect(modelMatchesQuery("gpt-6-astra", "gpt5")).toBe(false);
+    expect(modelMatchesQuery("gpt-6-astra", "   ")).toBe(true);
+    expect(modelMatchesQuery("gpt-6-astra", "---")).toBe(false);
+    expect(modelMatchesQuery("gpt-5.6-sol", "gpt 6")).toBe(false);
+    expect(modelMatchesQuery("gpt-5.6-sol", "gpt 5")).toBe(true);
+    expect(modelMatchesQuery("gpt-5.6-sol", "gpt 5.6")).toBe(true);
+  });
+  it("does not infer the friendly identity of an unknown prefixed model", () => {
+    expect(modelMatchesQuery("org/gpt-6-astra", "org gpt6")).toBe(true);
+    expect(modelMatchesQuery("org/model-x", "GPT 6")).toBe(false);
+    expect(modelMatchesQuery("org/自定义模型", "自定义")).toBe(true);
+  });
+});
+
+describe("modelCapabilities is a read-only catalog lookup that never guesses", () => {
+  it("returns reviewed capabilities for a catalog hit", () => {
+    expect(modelCapabilities("gpt-6-astra")).toEqual({
+      contextWindow: 1050000,
+      maxOutputTokens: 128000,
+      input: ["text", "image"],
+      reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
+      toolUse: true,
+    });
+  });
+
+  it("finds a catalog model whatever case the site typed it in", () => {
+    expect(modelCapabilities("DeepSeek-V4.1-Flash-1017")).toEqual(
+      modelCapabilities("deepseek-v4.1-flash-1017"),
+    );
+    expect(hasReviewedCapabilities("DeepSeek-V4.1-Flash-1017")).toBe(true);
+  });
+
+  it("reads an effort suffix whatever case the site typed it in", () => {
+    expect(modelCapabilities("Gemini-3.7-Flash-HIGH")).toEqual(
+      modelCapabilities("gemini-3.7-flash-high"),
+    );
+  });
+
+  it("returns an empty object for unknown models instead of guessing", () => {
+    expect(modelCapabilities("not-a-real-model")).toEqual({});
+    expect(modelCapabilities("")).toEqual({});
+  });
+
+  it("returns an empty object for known routing aliases we do not declare", () => {
+    expect(modelCapabilities("codex-auto-review")).toEqual({});
+    expect(modelCapabilities("gpt-image-2")).toEqual({});
+  });
+
+  it("declares tool use for verified models but never for routing aliases", () => {
+    // 逐家族抽样：全部核实为支持工具调用。
+    for (const model of [
+      "gpt-6-astra",
+      "deepseek-r1",
+      "claude-haiku-4-5",
+      "gemini-3.5-flash",
+      "qwen3.7-max",
+      "glm-5.3",
+      "kimi-k3",
+      "doubao-seed-2.1-pro",
+      "llama-4-maverick",
+      "hy4-preview",
+    ]) {
+      expect(modelCapabilities(model).toolUse).toBe(true);
+    }
+    // ark-code-latest 是火山方舟控制台路由别名，能力随路由变化——不猜。
+    expect(modelCapabilities("ark-code-latest").toolUse).toBeUndefined();
+  });
+
+  it("exposes the default reasoning level when the catalog declares one", () => {
+    expect(modelCapabilities("deepseek-v4-flash").defaultReasoning).toBe(
+      "high",
+    );
+    expect(modelCapabilities("gpt-6-astra").defaultReasoning).toBeUndefined();
+  });
+
+  it("uses the provider's published effort list for the GPT-6 and Grok ids Codex was missing", () => {
+    expect(modelCapabilities("gpt-6-sol")).toMatchObject({
+      reasoningLevels: ["none", "low", "medium", "high", "xhigh", "max"],
+      defaultReasoning: "medium",
+      contextWindow: 1050000,
+      maxOutputTokens: 128000,
+      input: ["text", "image"],
+      toolUse: true,
+    });
+    expect(modelCapabilities("gpt-6.1-sol").reasoningLevels).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(modelCapabilities("gpt-6.1-sol").defaultReasoning).toBe("medium");
+    expect(modelCapabilities("gpt-6-luna").reasoningLevels?.[0]).toBe("none");
+    expect(modelCapabilities("grok-4.6")).toMatchObject({
+      reasoningLevels: ["low", "medium", "high", "xhigh"],
+      defaultReasoning: "high",
+      contextWindow: 500000,
+      input: ["text", "image"],
+      toolUse: true,
+    });
+    expect(modelCapabilities("grok-4.6").maxOutputTokens).toBeUndefined();
+    expect(modelCapabilities("grok-4.7").maxOutputTokens).toBeUndefined();
+    expect(modelCapabilities("grok-4.7").reasoningLevels).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+  });
+
+  it("labels MiMo-V2.6 from Xiaomi's model card and does not invent effort levels", () => {
+    for (const id of ["mimo-v2.6-pro", "mimo-v2.6-flash"]) {
+      expect(modelCapabilities(id)).toMatchObject({
+        reasoningLevels: [],
+        contextWindow: 1048576,
+        maxOutputTokens: 131072,
+        input: ["text", "image"],
+        toolUse: true,
+      });
+      expect(modelCapabilities(id).defaultReasoning).toBeUndefined();
+    }
+  });
+
+  it("omits fields the catalog entry does not declare", () => {
+    // Every entry in the merged catalog carries the four fields, so prove the
+    // field-missing state with a defensive check: the API must only surface
+    // fields that are actually present, never synthesize values.
+    for (const model of ["gpt-6-astra", "kimi-k3", "glm-5.3", "hy4-preview"]) {
+      const capabilities = modelCapabilities(model);
+      expect(
+        Object.values(capabilities).every((value) => value !== undefined),
+      ).toBe(true);
+    }
+    // Input modalities are passed through verbatim, not inferred.
+    expect(modelCapabilities("glm-5.3").input).toEqual(["text"]);
+    expect(modelCapabilities("claude-sonnet-5").input).toEqual([
+      "text",
+      "image",
+    ]);
+  });
+});
+
+describe("a reasoning effort baked into the model id resolves to its base model", () => {
+  // 中转卖的是 `gemini-3.7-flash-high`，目录里收的是 `gemini-3.7-flash`。
+  // 不拆后缀的话这几个型号在界面上一条标注都没有 —— 线上三个 gemini 就是
+  // 这么变成裸 ID 的。
+  it("reads the base model's reviewed capabilities", () => {
+    const base = modelCapabilities("gemini-3.7-flash");
+    const pinned = modelCapabilities("gemini-3.7-flash-high");
+    expect(base.contextWindow).toBe(1048576);
+    expect(pinned.contextWindow).toBe(base.contextWindow);
+    expect(pinned.maxOutputTokens).toBe(base.maxOutputTokens);
+    expect(pinned.input).toEqual(base.input);
+    expect(pinned.toolUse).toBe(true);
+  });
+
+  it("reports the one pinned level, not the base model's whole ladder", () => {
+    // ID 已经把档位钉死了。照搬 ["low","high"] 会让人以为还能选。
+    expect(modelCapabilities("gemini-3.7-flash").reasoningLevels).toEqual([
+      "low",
+      "high",
+    ]);
+    expect(modelCapabilities("gemini-3.7-flash-high").reasoningLevels).toEqual([
+      "high",
+    ]);
+    expect(modelCapabilities("gemini-3.1-pro-low").reasoningLevels).toEqual([
+      "low",
+    ]);
+    expect(
+      modelCapabilities("gemini-3.7-flash-high").defaultReasoning,
+    ).toBeUndefined();
+  });
+
+  it("names the level so two variants of one model stay distinguishable", () => {
+    expect(modelDisplayName("gemini-3.8-flash-high")).toBe(
+      "Gemini 3.8 Flash (high)",
+    );
+    expect(modelDisplayName("gemini-3.8-flash")).toBe("Gemini 3.8 Flash");
+    expect(modelMatchesQuery("gemini-3.7-flash-high", "gemini 3.7")).toBe(true);
+  });
+
+  it("only splits the families the relay splits, and exact hits always win", () => {
+    // qwen3.8-max 是一个完整型号名，不是 qwen3.8 跑在 max 档。中转的
+    // ParseOpenAIReasoningEffortFromModelSuffix 只认 gpt-/o<n>/claude-/gemini-，
+    // 这里跟它一致，否则这个型号会被拆坏。
+    expect(modelCapabilities("qwen3.8-max").reasoningLevels).toEqual([
+      "low",
+      "medium",
+      "xhigh",
+    ]);
+    expect(modelDisplayName("qwen3.8-max")).toBe("Qwen3.8 Max");
+    // 能力照旧不猜；名称可以读成人话，方便小白辨认。
+    expect(modelCapabilities("gemini-9.9-nonexistent-high")).toEqual({});
+    expect(modelDisplayName("gemini-9.9-nonexistent-high")).toBe(
+      "Gemini 9.9 Nonexistent High",
+    );
+  });
+});
+
+describe("the default pick avoids a model we cannot describe", () => {
+  it("separates catalogued models from server-side routing aliases", () => {
+    // WorkBuddy 的截图里默认选中的就是 codex-auto-review：字母序第一，
+    // 目录里没有任何资料，卡片上一个标注都没有。
+    expect(hasReviewedCapabilities("codex-auto-review")).toBe(false);
+    expect(hasReviewedCapabilities("codexpro/")).toBe(false);
+    expect(hasReviewedCapabilities("glm-5.3")).toBe(true);
+    expect(hasReviewedCapabilities("gpt-6-astra")).toBe(true);
+    // 带档位后缀的也算有资料 —— 解析后能查到基础型号。
+    expect(hasReviewedCapabilities("gemini-3.7-flash-high")).toBe(true);
+  });
+});
+
+describe("humanizeModelId helps beginners read unknown API ids", () => {
+  it("strips date suffixes and titles common families", async () => {
+    const { humanizeModelId, modelDisplayName, shortModelId } = await import(
+      "./profile"
+    );
+    expect(humanizeModelId("claude-sonnet-4-5-20250929")).toBe(
+      "Claude Sonnet 4.5",
+    );
+    expect(modelDisplayName("claude-sonnet-4-5-20250929")).toBe(
+      "Claude Sonnet 4.5",
+    );
+    // 单个字母紧跟数字的是版本写法，不拆开。
+    expect(modelDisplayName("DeepSeek-V4.1-Flash-1017")).toBe(
+      "DeepSeek V4.1 Flash 1017",
+    );
+    // Catalog wins over humanize.
+    expect(modelDisplayName("glm-5.3")).toMatch(/GLM/i);
+    expect(shortModelId("claude-sonnet-4-5-20250929", 20).includes("…")).toBe(
+      true,
+    );
+  });
+});

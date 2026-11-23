@@ -1,0 +1,12 @@
+# Code owners for YesChoy.
+#
+# With branch protection's "Require review from Code Owners", a PR cannot merge
+# without an approval from the owner below.
+
+# Global fallback: every PR needs owner approval before merging.
+*                 @DaydreamZXG
+
+# Most sensitive paths — CI/signing/release and the Rust backend. Listed
+# explicitly so they stay locked even if the global rule above is relaxed later.
+/.github/         @DaydreamZXG
+/src-tauri/       @DaydreamZXG

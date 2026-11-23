@@ -1,0 +1,531 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import type { AccountLineId } from "./preview";
+
+// PRD §3.2 定案：与 Rust 侧 tool_adapters::TARGETS / CONNECTION_TOOLS 保持
+// 一致（12 个已支持工具）。
+// 增删工具须先改 appCatalog 展示源并通过强校验，再同步此处与 Rust。
+export const ACTIVATION_TOOL_IDS = [
+  "claude_code",
+  "claude_desktop",
+  "codex_desktop",
+  "pi",
+  "opencode",
+  "dsh_web",
+  "workbuddy",
+  "dsh_desktop",
+  "cline",
+  "hermes",
+  "openclaw",
+  "cursorpp",
+] as const;
+
+export type ActivationToolId = (typeof ACTIVATION_TOOL_IDS)[number];
+
+export interface ModelBinding {
+  modelId: string;
+  billingGroup: string;
+}
+export function decodeModelBindings(value: unknown): ModelBinding[] | null {
+  if (!Array.isArray(value) || value.length > 200) return null;
+  if (
+    value.some(
+      (v) =>
+        !object(v) ||
+        !exactKeys(v, ["modelId", "billingGroup"]) ||
+        !safeText(v.modelId, 200, false) ||
+        !safeText(v.billingGroup, 128, false) ||
+        v.billingGroup === "auto",
+    )
+  )
+    return null;
+  if (new Set(value.map((v) => v.modelId)).size !== value.length) return null;
+  return value as ModelBinding[];
+}
+/**
+ * 和 `decodeModelBindings` 同一套规矩，多一个 `reasonCode`。
+ *
+ * 单独写而不是复用，是因为键集是精确比对的：拿绑定的校验器去过一个多带字段的
+ * 对象，只会整个拒掉，而不是「宽松一点」。
+ */
+export function decodeSkippedBindings(value: unknown): SkippedBinding[] | null {
+  if (!Array.isArray(value) || value.length > 200) return null;
+  if (
+    value.some(
+      (v) =>
+        !object(v) ||
+        !exactKeys(v, ["modelId", "billingGroup", "reasonCode"]) ||
+        !safeText(v.modelId, 200, false) ||
+        !safeText(v.billingGroup, 128, false) ||
+        !safeText(v.reasonCode, 80, false),
+    )
+  )
+    return null;
+  return value as SkippedBinding[];
+}
+export function sameModelBindings(a: ModelBinding[], b: ModelBinding[]) {
+  return (
+    a.length === b.length &&
+    a.every((m) =>
+      b.some(
+        (n) => n.modelId === m.modelId && n.billingGroup === m.billingGroup,
+      ),
+    )
+  );
+}
+
+export const ACTIVATION_TARGET_STATUSES = [
+  "not_found",
+  "available",
+  "selection_required",
+  "missing_runtime",
+  // 装了，但只能由用户自己去那个应用里填（Cline 的编辑器扩展）。
+  "manual_only",
+] as const;
+
+export type ActivationTargetStatus =
+  (typeof ACTIVATION_TARGET_STATUSES)[number];
+
+export interface ActivationInstallation {
+  installationId: string;
+  label: string;
+  version: string;
+  supported: boolean;
+  recommended: boolean;
+  /** 这一份打开的是终端窗口，不是应用窗口（Codex 只装了命令行版时）。 */
+  terminal?: true;
+}
+
+export const MANUAL_LOCATION_STATES = [
+  "none",
+  "in_use",
+  "unavailable",
+] as const;
+
+/**
+ * 用户手动指定的安装位置：`in_use` 正在使用；`unavailable` 是指定过、
+ * 但现在验不过（卸载了、挪走了、移动硬盘没插），此时用的是自动检测结果。
+ */
+export type ManualLocationState = (typeof MANUAL_LOCATION_STATES)[number];
+
+export interface ActivationTarget {
+  toolId: ActivationToolId;
+  displayName: string;
+  surface: string;
+  status: ActivationTargetStatus;
+  installations: ActivationInstallation[];
+  manualLocation: ManualLocationState;
+}
+
+export interface ActivationTargetScan {
+  requestId: string;
+  schemaVersion: 1;
+  platform: "macos" | "windows" | "linux" | "unknown";
+  targets: ActivationTarget[];
+}
+
+export const TOOL_ACTIVATION_STATUSES = [
+  "ready",
+  "application_running",
+  "signed_out",
+  "tool_not_found",
+  "multiple_installations",
+  "missing_runtime",
+  "unsupported_profile",
+  "unsupported_model",
+  "external_override",
+  "secure_storage_unavailable",
+  "configuration_failed",
+  "launch_failed",
+  "verification_failed",
+  "server_unavailable",
+  "invalid_request",
+] as const;
+
+export type ToolActivationStatus = (typeof TOOL_ACTIVATION_STATUSES)[number];
+
+/**
+ * 这次没写进应用的绑定，以及每个是因为什么。
+ *
+ * 一个计费分组铸不出密钥时，接入不再整单失败 —— 其余照常写入，这里列出少了谁。
+ * 没有它的话，界面只会说「接入完成」，而列表里那个模型其实不能用。
+ */
+export interface SkippedBinding extends ModelBinding {
+  reasonCode: string;
+}
+
+export interface ToolActivationProjection {
+  requestId: string;
+  schemaVersion: 3 | 4 | 5;
+  status: ToolActivationStatus;
+  toolId: ActivationToolId;
+  modelId: string;
+  billingGroup: string;
+  observedAtEpochMs: number;
+  reasonCode: string;
+  models?: ModelBinding[];
+  skipped?: SkippedBinding[];
+}
+
+export const ACTIVATION_PROGRESS_EVENT = "yeschoy://activation-progress";
+// Discovery is read-only, but Windows package metadata and trust checks can be
+// delayed by a damaged install or security software. Never leave the setup
+// action in a permanent "checking" state when the native reply is lost.
+export const ACTIVATION_TARGET_SCAN_DEADLINE_MS = 15_000;
+// Native activation includes bounded account calls and a desktop restart. The
+// renderer must still recover if the OS, keychain, installer, or network stack
+// never returns. Native cancellation then performs transaction cleanup.
+export const ACTIVATION_REQUEST_DEADLINE_MS = 90_000;
+// 设置已经写好、正在替用户打开命令行应用的这一步不计时：第一次打开要先让人选
+// 一个项目文件夹，选多久由人定。计时到了去取消，取消不掉已经写好的设置，只会
+// 把一次接成了的接入报成“没接成”。出了这一步，剩下的时间接着计。
+// 只有在终端里打开的应用才这样：桌面应用这一步不等人，卡住了照旧到点放弃。
+const UNTIMED_STAGE: ActivationProgress["stage"] = "opening_application";
+export const ACTIVATION_PROGRESS_STAGES = [
+  "queued",
+  "checking_application",
+  "authenticating",
+  "checking_models",
+  "securing_access",
+  "preparing_settings",
+  "applying_settings",
+  "restoring_settings",
+  "opening_application",
+  "checking_application_started",
+  "complete",
+] as const;
+
+export interface ActivationProgress {
+  requestId: string;
+  toolId: ActivationToolId;
+  stage: (typeof ACTIVATION_PROGRESS_STAGES)[number];
+  completedSteps: number;
+  totalSteps: number;
+}
+
+export function decodeActivationProgress(
+  value: unknown,
+): ActivationProgress | null {
+  if (!object(value)) return null;
+  if (
+    !exactKeys(value, [
+      "requestId",
+      "toolId",
+      "stage",
+      "completedSteps",
+      "totalSteps",
+    ]) ||
+    !safeText(value.requestId, 120, false) ||
+    !ACTIVATION_TOOL_IDS.includes(value.toolId as ActivationToolId) ||
+    !ACTIVATION_PROGRESS_STAGES.includes(
+      value.stage as ActivationProgress["stage"],
+    ) ||
+    !Number.isSafeInteger(value.completedSteps) ||
+    !Number.isSafeInteger(value.totalSteps) ||
+    (value.completedSteps as number) < 0 ||
+    (value.totalSteps as number) < 1 ||
+    (value.completedSteps as number) > (value.totalSteps as number)
+  )
+    return null;
+  return value as unknown as ActivationProgress;
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]) {
+  return (
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+  );
+}
+
+function safeText(
+  value: unknown,
+  maximum: number,
+  empty = true,
+): value is string {
+  return (
+    typeof value === "string" &&
+    (empty || value.length > 0) &&
+    Array.from(value).length <= maximum &&
+    !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(value)
+  );
+}
+
+function decodeInstallation(value: unknown): ActivationInstallation | null {
+  if (!object(value)) return null;
+  const keys = [
+    "installationId",
+    "label",
+    "version",
+    "supported",
+    "recommended",
+  ];
+  if ("terminal" in value) {
+    if (value.terminal !== true) return null;
+    keys.push("terminal");
+  }
+  if (
+    !exactKeys(value, keys) ||
+    !/^i[0-9a-f]{16}$/.test(String(value.installationId)) ||
+    !safeText(value.label, 100, false) ||
+    !safeText(value.version, 80) ||
+    typeof value.supported !== "boolean" ||
+    typeof value.recommended !== "boolean"
+  )
+    return null;
+  return value as unknown as ActivationInstallation;
+}
+
+function decodeTarget(value: unknown): ActivationTarget | null {
+  if (!object(value)) return null;
+  if (
+    !exactKeys(value, [
+      "toolId",
+      "displayName",
+      "surface",
+      "status",
+      "installations",
+      "manualLocation",
+    ]) ||
+    !ACTIVATION_TOOL_IDS.includes(value.toolId as ActivationToolId) ||
+    !MANUAL_LOCATION_STATES.includes(
+      value.manualLocation as ManualLocationState,
+    ) ||
+    !safeText(value.displayName, 80, false) ||
+    !safeText(value.surface, 120, false) ||
+    !ACTIVATION_TARGET_STATUSES.includes(
+      value.status as ActivationTargetStatus,
+    ) ||
+    !Array.isArray(value.installations) ||
+    value.installations.length > 8
+  )
+    return null;
+  const installations = value.installations.map(decodeInstallation);
+  if (installations.some((item) => item === null)) return null;
+  return {
+    ...(value as unknown as Omit<ActivationTarget, "installations">),
+    installations: installations as ActivationInstallation[],
+  };
+}
+
+export function decodeActivationTargetScan(
+  value: unknown,
+  requestId: string,
+): ActivationTargetScan | null {
+  if (!object(value)) return null;
+  if (
+    !exactKeys(value, ["requestId", "schemaVersion", "platform", "targets"]) ||
+    value.requestId !== requestId ||
+    value.schemaVersion !== 1 ||
+    !["macos", "windows", "linux", "unknown"].includes(
+      String(value.platform),
+    ) ||
+    !Array.isArray(value.targets) ||
+    value.targets.length !== ACTIVATION_TOOL_IDS.length
+  )
+    return null;
+  const targets = value.targets.map(decodeTarget);
+  if (targets.some((target) => target === null)) return null;
+  const toolIds = targets.map((target) => target!.toolId);
+  if (
+    new Set(toolIds).size !== ACTIVATION_TOOL_IDS.length ||
+    !ACTIVATION_TOOL_IDS.every((toolId) => toolIds.includes(toolId))
+  )
+    return null;
+  return {
+    ...(value as unknown as Omit<ActivationTargetScan, "targets">),
+    targets: targets as ActivationTarget[],
+  };
+}
+
+export function decodeToolActivation(
+  value: unknown,
+  requestId: string,
+): ToolActivationProjection | null {
+  if (!object(value)) return null;
+  if (
+    // 4 起带 `models`，5 起多带一个 `skipped`。`exactKeys` 是键集精确比对，
+    // 所以每加一个字段都必须升版本 —— 不能在旧版本号上悄悄多带一个键。
+    !exactKeys(value, [
+      "requestId",
+      "schemaVersion",
+      "status",
+      "toolId",
+      "modelId",
+      "billingGroup",
+      "observedAtEpochMs",
+      "reasonCode",
+      ...(Number(value.schemaVersion) >= 4 ? ["models"] : []),
+      ...(Number(value.schemaVersion) >= 5 ? ["skipped"] : []),
+    ]) ||
+    value.requestId !== requestId ||
+    ![3, 4, 5].includes(Number(value.schemaVersion)) ||
+    (Number(value.schemaVersion) >= 4 &&
+      (!decodeModelBindings(value.models) ||
+        !(value.models as ModelBinding[]).some(
+          (m) =>
+            m.modelId === value.modelId &&
+            m.billingGroup === value.billingGroup,
+        ))) ||
+    (Number(value.schemaVersion) >= 5 &&
+      !decodeSkippedBindings(value.skipped)) ||
+    !TOOL_ACTIVATION_STATUSES.includes(value.status as ToolActivationStatus) ||
+    !ACTIVATION_TOOL_IDS.includes(value.toolId as ActivationToolId) ||
+    !safeText(value.modelId, 200, false) ||
+    !safeText(value.billingGroup, 128, false) ||
+    !Number.isSafeInteger(value.observedAtEpochMs) ||
+    (value.observedAtEpochMs as number) < 0 ||
+    !safeText(value.reasonCode, 80, false)
+  )
+    return null;
+  return value as unknown as ToolActivationProjection;
+}
+
+let scanSequence = 0;
+let activationSequence = 0;
+
+export async function scanActivationTargets(): Promise<ActivationTargetScan> {
+  scanSequence += 1;
+  const requestId = `target-scan-${Date.now().toString(36)}-${scanSequence.toString(36)}`;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const raw = await Promise.race([
+    invoke<unknown>("scan_activation_targets_v1", {
+      request: { requestId },
+    }),
+    new Promise<never>((_resolve, reject) => {
+      deadline = setTimeout(
+        () => reject(new Error("activation_target_scan_timed_out")),
+        ACTIVATION_TARGET_SCAN_DEADLINE_MS,
+      );
+    }),
+  ]).finally(() => {
+    if (deadline !== undefined) clearTimeout(deadline);
+  });
+  const result = decodeActivationTargetScan(raw, requestId);
+  if (!result) throw new Error("invalid_activation_target_scan");
+  return result;
+}
+
+export async function activateDesktopTool(input: {
+  lineId: AccountLineId;
+  toolId: ActivationToolId;
+  modelId: string;
+  installationId: string;
+  billingGroup: string;
+  models?: ModelBinding[];
+  installationJobId?: string;
+  restartRunningApp?: boolean;
+  displaceClaudeLogin?: boolean;
+  /** 挑中的这一份在终端里打开：打开那一步可能在等人选文件夹。不发给后端。 */
+  opensInTerminal?: boolean;
+  onRequestId?: (requestId: string) => void;
+}): Promise<ToolActivationProjection> {
+  if (
+    input.models &&
+    (!decodeModelBindings(input.models) ||
+      !input.models.some(
+        (m) =>
+          m.modelId === input.modelId && m.billingGroup === input.billingGroup,
+      ))
+  )
+    throw new Error("invalid_model_set");
+  activationSequence += 1;
+  const requestId = `activate-${Date.now().toString(36)}-${activationSequence.toString(36)}`;
+  input.onRequestId?.(requestId);
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const nativeRequest = invoke<unknown>("configure_desktop_tool_v2", {
+    request: {
+      requestId,
+      lineId: input.lineId,
+      toolId: input.toolId,
+      modelId: input.modelId,
+      installationId: input.installationId,
+      billingGroup: input.billingGroup,
+      ...(input.models ? { models: input.models } : {}),
+      ...(input.installationJobId
+        ? { installationJobId: input.installationJobId }
+        : {}),
+      ...(input.restartRunningApp ? { restartRunningApp: true } : {}),
+      ...(input.displaceClaudeLogin ? { displaceClaudeLogin: true } : {}),
+    },
+  });
+  let live = true;
+  let unlisten: (() => void) | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    let left = ACTIVATION_REQUEST_DEADLINE_MS;
+    let since = 0;
+    const arm = () => {
+      since = Date.now();
+      deadline = setTimeout(() => {
+        void cancelDesktopToolActivation(requestId).catch(() => undefined);
+        reject(new Error("activation_request_timed_out"));
+      }, left);
+    };
+    const pause = () => {
+      if (deadline === undefined) return;
+      clearTimeout(deadline);
+      deadline = undefined;
+      left = Math.max(0, left - (Date.now() - since));
+    };
+    arm();
+    void listen<unknown>(ACTIVATION_PROGRESS_EVENT, ({ payload }) => {
+      const progress = decodeActivationProgress(payload);
+      if (!live || progress?.requestId !== requestId) return;
+      if (input.opensInTerminal && progress.stage === UNTIMED_STAGE) pause();
+      else if (deadline === undefined) arm();
+    })
+      .then((stop) => {
+        if (live) unlisten = stop;
+        else stop();
+      })
+      .catch(() => undefined);
+  });
+  let raw: unknown;
+  try {
+    raw = await Promise.race([nativeRequest, timedOut]);
+  } finally {
+    live = false;
+    unlisten?.();
+    clearTimeout(deadline);
+  }
+  const result = decodeToolActivation(raw, requestId);
+  if (
+    !result ||
+    result.toolId !== input.toolId ||
+    result.modelId !== input.modelId ||
+    result.billingGroup !== input.billingGroup ||
+    // `>= 4` 而不是 `=== 4`：写死版本号的话，下一次升 schema 就会把这条
+    // 「不许偷偷多报模型」的检查整个跳过 —— 校验器变成摆设而没有人会发现。
+    (result.schemaVersion >= 4 &&
+      !sameModelBindings(
+        result.models!,
+        input.models ?? [
+          { modelId: input.modelId, billingGroup: input.billingGroup },
+        ],
+      )) ||
+    (input.models && input.models.length > 1 && result.schemaVersion < 4)
+  )
+    throw new Error("invalid_tool_activation_projection");
+  return result;
+}
+
+export async function cancelDesktopToolActivation(
+  requestId: string,
+): Promise<"cancel_requested" | "not_found"> {
+  if (!safeText(requestId, 120, false))
+    throw new Error("invalid_activation_cancel_request");
+  const raw = await invoke<unknown>("cancel_tool_activation_v1", {
+    request: { requestId },
+  });
+  if (
+    !object(raw) ||
+    !exactKeys(raw, ["requestId", "status"]) ||
+    raw.requestId !== requestId ||
+    !["cancel_requested", "not_found"].includes(String(raw.status))
+  )
+    throw new Error("invalid_activation_cancel_response");
+  return raw.status as "cancel_requested" | "not_found";
+}

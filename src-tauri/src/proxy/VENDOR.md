@@ -1,0 +1,97 @@
+# vendored 自 cc-switch
+
+来源：`github.com/farion1231/cc-switch`
+提交：`06082e189d65e6d6dbadc35dacdac1ce6c79d89a`（main，2026-09-15）
+取回日期：2026-09-20
+
+## 规矩
+
+`src/proxy/` 下除 `mod.rs` 与本文件外，**每个文件都与上游逐字节相同**。
+`proxy::tests::vendored_files_are_unmodified` 守着这条：改一个字节测试就红。
+
+野菜特有的行为**写在我们自己的文件里、包着调用**上游的公开入口，不要改这里。
+上一次 vendoring（`23c12bd3` 之前）把逻辑打进了上游文件，于是每次同步都要
+重打一遍补丁 —— 那正是这次要避免的。
+
+## 边界
+
+这个目录是一个独立的「协议转换」模块，项目里只有两个文件引用它，一个应用家族
+一个（`proxy::tests::only_the_bridges_reach_into_the_vendored_code` 守着）：
+
+- `codex_responses_bridge.rs`：Codex 的 Responses 格式 ↔ Chat 格式；
+- `claude_chat_bridge.rs`：Claude 的 Anthropic 格式 ↔ Chat 格式。
+
+其余代码要做协议转换，调用这两个文件里我们自己写的入口。
+
+这样做是为了两件事：出处一目了然（来自 CC Switch 的就是这个目录，不多不少）；
+将来换成自己的实现时，只需要改这两个文件。
+
+## 怎么重新同步
+
+```bash
+SHA=<上游新的 commit>
+for f in error.rs json_canonical.rs sse.rs tool_media.rs \
+         providers/codex_chat_common.rs providers/codex_responses_sse.rs; do
+  curl -sSL "https://raw.githubusercontent.com/farion1231/cc-switch/$SHA/src-tauri/src/proxy/$f" \
+    -o src-tauri/src/proxy/$f
+done
+# 更新下面的 sha256 与上面的提交号，然后 cargo test --lib
+```
+
+同步后**必须跑全量测试**：上游这些文件自带单测，它们是行为对不对的判据。
+
+## 已 vendored 的文件
+
+| 文件 | sha256 |
+| --- | --- |
+| `error.rs` | `5c3a781b02321874dd2c59735c1a5121461ceeba0d6b988318f3747605d6ce88` |
+| `json_canonical.rs` | `23715ee65bd5a5bedb55c330247a3b1811f612083e0bd6deaa89bd41109c5772` |
+| `sse.rs` | `d74fa5e207fa4de5f47f076b1df9a78e96522e095a2cd8c087d6eebd82217634` |
+| `tool_media.rs` | `496ce69210d50a689baff3b88daeb45cd015bd35b8a4e24e97a324c4a0389706` |
+| `providers/codex_chat_common.rs` | `41412157670fedab83a01461a9fc43acfb9a89fbfd1f9ef786929fa3343da0c8` |
+| `providers/codex_responses_sse.rs` | `2e4f27b66b51c60244e7a95270bae1ef884433d04bab5684f98fc505302d1057` |
+| `providers/streaming.rs` | `f8aac207950e415da8f14c31a0bbc0834bce6819d8075dc5faa06d8296a041b2` |
+| `providers/transform.rs` | `0058cc7988cc075d1da516f31b674563d17e4930f1d12b453bbf633b71f39dc8` |
+| `usage/parser.rs` | `8fe0554e871b223e4c9142d8e1c7060c2ebc5c9b7fea1d0bac26425b8dcb4a8d` |
+| `providers/codex_chat_history.rs` | `535bf8654e96b25fa4d16756636ad43aa1186a7e414763b1de3006314b13c06f` |
+| `providers/streaming_codex_chat.rs` | `b32a4e41811db3df5f99e02de5569bcb1676fdd3ef857754deb53c3e456ddfb9` |
+| `providers/transform_codex_chat.rs` | `b6f26645059887fda09d4190546117f4908b06cfb630447aa065e67ebf9b5f16` |
+
+## 依赖
+
+vendored 的文件带来了四个直接依赖。**四个的对应版本都已在本地 registry 缓存里**，
+所以不产生新下载，`--offline` 出包不受影响：
+
+| crate | 谁需要 | 备注 |
+| --- | --- | --- |
+| `thiserror = "2.0"` | `error.rs` | 2.0.18 本来就在 lock 里 |
+| `bytes = "1.5"` | `providers/codex_responses_sse.rs` | 1.11.1 本来就在 lock 里 |
+| `async-stream = "0.3"` | `providers/streaming.rs` | 0.3.6 不在 lock、但在缓存里 |
+| `uuid = { "1.11", features = ["v4"] }` | `usage/parser.rs` | 1.22.0 本来就在 lock 里 |
+
+**再 vendor 新文件时预期还会冒出依赖**。判断标准：先查
+`~/.cargo/registry/cache/` 有没有，有就只改 lock、不动网络。
+
+## 刻意没取的上游文件
+
+- `proxy/usage/calculator.rs`、`proxy/usage/logger.rs` —— 成本计算与
+  **把用量写进 cc-switch 自己的存储**。野菜的用量走服务端账单，不需要，
+  也不该让它往别处写。`usage/mod.rs` 因此是我们写的子集版。
+
+## 与 clippy 的关系
+
+我们的 clippy 可能比上游 CI 用的那版严，于是 vendored 文件会挑出 lint
+（已遇到：`transform_codex_chat.rs` 里的 `clippy::op_ref`）。
+
+**一律在 `mod.rs` 的模块声明上 `#[allow(...)]`，绝不改文件。** 改一个 lint
+看着无害，但它会让下次 `cp` 同步覆盖掉你的修改、或者制造一个假冲突 ——
+本地分叉就是这么一行一行长出来的。
+
+## 与 `cargo fmt` 的关系
+
+两边都用 rustfmt 默认配置（双方都没有 `rustfmt.toml`），所以 `cargo fmt`
+跑过之后 vendored 文件哈希不变，不会和守卫测试打架 —— 已实测。
+
+**万一将来某个上游文件不是 rustfmt-clean 的**，`cargo fmt` 会改动它、守卫随即变红。
+那时**不要**为了让测试通过就接受 fmt 的改动（那等于开始维护一份本地分叉），
+应当把该文件排除在 fmt 之外，或向上游提 issue。

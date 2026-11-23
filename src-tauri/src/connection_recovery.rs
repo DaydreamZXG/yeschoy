@@ -1,0 +1,3279 @@
+//! A single encrypted recovery baseline per tool, never a backup history.
+//! Nothing in this module exposes file contents or paths to the renderer.
+//!
+//! The baseline is sealed with a key held in the OS keyring. Because the
+//! originals live nowhere else once activation has rewritten the real config
+//! files, losing that keyring entry would otherwise make them unrecoverable, so
+//! `save` also drops an owner-only plain copy under `original/<tool>/` with a
+//! note explaining how to put the files back by hand. The sealed journal stays
+//! the only path the application itself ever reads.
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
+
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::tool_adapters::common::{self, FileChange};
+use crate::tool_credentials::ToolCredential;
+
+const SERVICE: &str = "com.yeschoy.desktop.connection-recovery.v1";
+// Four config files, before/after and one in-flight predecessor, with JSON
+// encoding overhead. This is a bounded journal, not an unbounded history.
+const MAX_JOURNAL: u64 = 128 * 1024 * 1024;
+const MAGIC: &[u8] = b"YC-RECOVERY-1\0";
+const MAX_BREAK_GLASS_FILE: u64 = 2 * 1024 * 1024;
+// A UTF-8 BOM and CRLF line endings, because the person most likely to open
+// this file is on Windows, in Notepad, after something already went wrong.
+const BREAK_GLASS_README: &str =
+    "\u{feff}这个文件夹里是 YesChoy 改动你的配置之前，那些文件的原始内容。\r\n\
+\r\n\
+正常情况下你用不到它：在助手里点「恢复原设置」就行。\r\n\
+只有当助手说恢复失败（通常是系统钥匙串里的密钥没了，比如重置过登录\r\n\
+钥匙串、换过开机密码、清过 Windows 凭据管理器），才需要手动来。\r\n\
+\r\n\
+怎么做：\r\n\
+1. 先完全退出对应的应用（Claude Desktop / Codex 等）。\r\n\
+2. 打开 manifest.json，里面每一项是一个文件：\r\n\
+   - copy                    这个文件夹里的副本文件名（0、1、2……）\r\n\
+   - restoreTo               要还原到的完整路径\r\n\
+   - existedBeforeActivation 接入之前这个文件是否存在\r\n\
+3. existedBeforeActivation 是 true：把 copy 覆盖回 restoreTo。\r\n\
+   existedBeforeActivation 是 false：直接删掉 restoreTo 那个文件。\r\n\
+4. 重新打开应用。\r\n\
+\r\n\
+这些副本可能包含你自己的密钥，权限已设为仅本人可读，别放进网盘或\r\n\
+同步目录，也别直接发给客服。\r\n";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Receipt {
+    pub(crate) tool_id: String,
+    pub(crate) model_id: String,
+    pub(crate) line_id: String,
+    pub(crate) billing_group: String,
+    pub(crate) updated_at_epoch_ms: u64,
+    pub(crate) requires_background: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Record {
+    version: u8,
+    pub(crate) receipt: Receipt,
+    pub(crate) original_known: bool,
+    pub(crate) files: Vec<FileChange>,
+    pub(crate) pending: bool,
+    // Only present while a configuration command is in flight. Discarded when
+    // it commits; used to preserve the preceding baseline on failed switching.
+    previous: Option<Box<Record>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollback_checkpoint: Option<RollbackCheckpoint>,
+}
+
+// Encrypted with the journal and present only during a desktop transaction.
+// `files` retains the immediate predecessor, unlike the original-use baseline.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackCheckpoint {
+    files: Vec<FileChange>,
+    credential: Option<ToolCredential>,
+}
+
+impl Record {
+    pub(crate) fn rollback_credential(&self) -> Option<&ToolCredential> {
+        self.rollback_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.credential.as_ref())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Failure {
+    Storage,
+    Invalid,
+    Changed,
+    Io,
+}
+type Result<T> = std::result::Result<T, Failure>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingRecoveryFailure {
+    Load,
+    Files,
+    Credential,
+    Receipt,
+}
+
+pub(crate) struct Store {
+    root: PathBuf,
+    key: [u8; 32],
+}
+
+// OS-released lock: a crash cannot strand the lock, and separate application
+// processes cannot initialize different keys or interleave configuration writes.
+pub(crate) fn operation_lock_at(root: &Path) -> Result<std::fs::File> {
+    let path = root.join("operation.lock");
+    common::ensure_safe_target(&path, 64).map_err(|_| Failure::Storage)?;
+    std::fs::create_dir_all(root).map_err(|_| Failure::Storage)?;
+    common::ensure_safe_target(&path, 64).map_err(|_| Failure::Storage)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|_| Failure::Storage)?;
+    file.try_lock().map_err(|_| Failure::Changed)?;
+    Ok(file)
+}
+
+pub(crate) fn operation_lock() -> Result<std::fs::File> {
+    let home = crate::tool_adapters::user_home().ok_or(Failure::Storage)?;
+    operation_lock_at(&crate::legacy::data_root(&home).join("connection-recovery"))
+}
+
+fn allowed(tool: &str) -> bool {
+    matches!(
+        tool,
+        "claude_code"
+            | "claude_desktop"
+            | "codex_desktop"
+            | "pi"
+            | "opencode"
+            | "dsh_web"
+            | "workbuddy"
+            | "dsh_desktop"
+            | "cline"
+            | "hermes"
+            | "openclaw"
+            | "cursorpp"
+    )
+}
+
+fn encode(key: &[u8; 32], tool: &str, record: &Record) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Failure::Storage)?;
+    let mut nonce = [0; 12];
+    getrandom::fill(&mut nonce).map_err(|_| Failure::Storage)?;
+    let plain = serde_json::to_vec(record).map_err(|_| Failure::Invalid)?;
+    if plain.len() as u64 > MAX_JOURNAL - 128 {
+        return Err(Failure::Invalid);
+    }
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plain,
+                aad: tool.as_bytes(),
+            },
+        )
+        .map_err(|_| Failure::Storage)?;
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend_from_slice(&nonce);
+    bytes.extend_from_slice(&encrypted);
+    Ok(bytes)
+}
+
+fn decode(key: &[u8; 32], tool: &str, bytes: &[u8]) -> Result<Record> {
+    if bytes.len() as u64 > MAX_JOURNAL
+        || !bytes.starts_with(MAGIC)
+        || bytes.len() < MAGIC.len() + 28
+    {
+        return Err(Failure::Invalid);
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Failure::Storage)?;
+    let nonce = &bytes[MAGIC.len()..MAGIC.len() + 12];
+    let plain = cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: &bytes[MAGIC.len() + 12..],
+                aad: tool.as_bytes(),
+            },
+        )
+        .map_err(|_| Failure::Invalid)?;
+    let record: Record = serde_json::from_slice(&plain).map_err(|_| Failure::Invalid)?;
+    validate_record(tool, &record)?;
+    Ok(record)
+}
+
+fn validate_record(tool: &str, record: &Record) -> Result<()> {
+    if !allowed(tool)
+        || record.version != 1
+        || record.receipt.tool_id != tool
+        || record.files.is_empty()
+        || record.files.len() > 4
+        || record
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.pending || previous.previous.is_some())
+    {
+        return Err(Failure::Invalid);
+    }
+    let mut paths = BTreeSet::new();
+    for file in &record.files {
+        if !file.path.is_absolute()
+            || file
+                .path
+                .components()
+                .any(|p| matches!(p, std::path::Component::ParentDir))
+            || !paths.insert(&file.path)
+            || file.after.len() > 2 * 1024 * 1024
+            || file
+                .before
+                .as_ref()
+                .is_some_and(|b| b.len() > 2 * 1024 * 1024)
+        {
+            return Err(Failure::Invalid);
+        }
+    }
+    if let Some(previous) = &record.previous {
+        validate_record(tool, previous)?;
+    }
+    if let Some(checkpoint) = &record.rollback_checkpoint {
+        if !record.pending
+            || !matches!(tool, "claude_desktop" | "codex_desktop")
+            || checkpoint
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<BTreeSet<_>>()
+                != paths
+            || checkpoint.files.len() != record.files.len()
+        {
+            return Err(Failure::Invalid);
+        }
+        let mut attempt = record.clone();
+        attempt.files = checkpoint.files.clone();
+        attempt.previous = None;
+        attempt.rollback_checkpoint = None;
+        validate_record(tool, &attempt)?;
+    }
+    Ok(())
+}
+
+// Taking the operation lock creates this directory before legacy credentials
+// are inspected. Its existence alone does not mean a recovery key was lost.
+fn recovery_store_is_uninitialized(root: &Path) -> Result<bool> {
+    common::ensure_safe_target(&root.join("operation.lock"), 64).map_err(|_| Failure::Storage)?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(_) => return Err(Failure::Storage),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|_| Failure::Storage)?;
+        // Unknown files, including unfinished records, may contain recovery
+        // material. Never replace their missing key or silently ignore them.
+        if entry.file_name() != "operation.lock" {
+            return Ok(false);
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| Failure::Storage)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 {
+            return Err(Failure::Storage);
+        }
+    }
+    Ok(true)
+}
+
+impl Store {
+    pub(crate) fn open(create: bool) -> Result<Option<Self>> {
+        let home = crate::tool_adapters::user_home().ok_or(Failure::Storage)?;
+        let root = crate::legacy::data_root(&home).join("connection-recovery");
+        // 改名前的恢复记录是用旧名字下那把钥匙封的：读的时候搬过来，记录照样解得开。
+        let key = match crate::legacy::read_secret(SERVICE, "encryption-key") {
+            Ok(Some(encoded)) => STANDARD
+                .decode(encoded)
+                .map_err(|_| Failure::Storage)?
+                .try_into()
+                .map_err(|_| Failure::Storage)?,
+            Ok(None) => {
+                if !recovery_store_is_uninitialized(&root)? {
+                    return Err(Failure::Storage);
+                }
+                if !create {
+                    return Ok(None);
+                }
+                let mut key = [0; 32];
+                getrandom::fill(&mut key).map_err(|_| Failure::Storage)?;
+                crate::legacy::write_secret(SERVICE, "encryption-key", &STANDARD.encode(key))
+                    .map_err(|_| Failure::Storage)?;
+                key
+            }
+            Err(_) => return Err(Failure::Storage),
+        };
+        Ok(Some(Self { root, key }))
+    }
+
+    fn path(&self, tool: &str) -> Result<PathBuf> {
+        if !allowed(tool) {
+            return Err(Failure::Invalid);
+        }
+        Ok(self.root.join(format!("{tool}.sealed")))
+    }
+
+    pub(crate) fn load(&self, tool: &str) -> Result<Option<Record>> {
+        common::snapshot_bounded(&self.path(tool)?, MAX_JOURNAL)
+            .map_err(|_| Failure::Io)?
+            .map(|bytes| decode(&self.key, tool, &bytes))
+            .transpose()
+    }
+
+    pub(crate) fn save(&self, record: &Record) -> Result<()> {
+        validate_record(&record.receipt.tool_id, record)?;
+        let path = self.path(&record.receipt.tool_id)?;
+        let bytes = encode(&self.key, &record.receipt.tool_id, record)?;
+        common::atomic_write_bounded(&path, &bytes, MAX_JOURNAL).map_err(|_| Failure::Io)?;
+        if common::snapshot_bounded(&path, MAX_JOURNAL).map_err(|_| Failure::Io)? != Some(bytes) {
+            return Err(Failure::Io);
+        }
+        // Best effort, and deliberately not fatal: the sealed journal above is
+        // the real recovery path. This is only the break-glass copy.
+        let _ = self.write_break_glass_copy(record);
+        Ok(())
+    }
+
+    /// An unencrypted, owner-only copy of the files as they were before we
+    /// touched them, plus a note telling the user how to put them back.
+    ///
+    /// The sealed journal is encrypted with a key kept in the OS keyring, and
+    /// the originals exist nowhere else — the config files on disk already hold
+    /// our values. So losing that keyring entry (a reset macOS login keychain, a
+    /// cleared Windows credential store, a Linux box with no secret service)
+    /// used to mean the user's original Claude Desktop or Codex configuration
+    /// was gone for good, with the UI able to say nothing better than "恢复失败".
+    ///
+    /// This copy holds the user's own configuration, which may well contain
+    /// their own credentials, so the directory is 0700 and every file 0600 —
+    /// no more exposed than the originals, and usually less.
+    fn write_break_glass_copy(&self, record: &Record) -> Result<()> {
+        let directory = self.break_glass_directory(&record.receipt.tool_id)?;
+        // Fail closed. This copy is readable by anyone who can read the file,
+        // so it is only worth having when it is provably owner-only — on
+        // Windows that means an ACL this build machine cannot test. Anything
+        // that goes wrong leaves no copy at all, which is exactly the behaviour
+        // that existed before it, rather than a half-written readable one.
+        match self.fill_break_glass_copy(record, &directory) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let _ = std::fs::remove_dir_all(&directory);
+                Err(failure)
+            }
+        }
+    }
+
+    fn fill_break_glass_copy(&self, record: &Record, directory: &Path) -> Result<()> {
+        let tool = &record.receipt.tool_id;
+        std::fs::create_dir_all(directory).map_err(|_| Failure::Io)?;
+        common::restrict_directory(directory).map_err(|_| Failure::Io)?;
+        let mut manifest = Vec::with_capacity(record.files.len());
+        for (index, file) in record.files.iter().enumerate() {
+            let entry = directory.join(index.to_string());
+            match &file.before {
+                Some(bytes) => write_protected(&entry, bytes)?,
+                // The file did not exist before activation. Recording that is
+                // the whole instruction: delete it to get back to the original.
+                None if entry.exists() => {
+                    std::fs::remove_file(&entry).map_err(|_| Failure::Io)?;
+                }
+                None => {}
+            }
+            manifest.push(serde_json::json!({
+                "copy": index.to_string(),
+                "restoreTo": file.path.to_string_lossy(),
+                "existedBeforeActivation": file.before.is_some(),
+            }));
+        }
+        let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "tool": tool,
+            "updatedAtEpochMs": record.receipt.updated_at_epoch_ms,
+            "files": manifest,
+        }))
+        .map_err(|_| Failure::Io)?;
+        write_protected(&directory.join("manifest.json"), &manifest_bytes)?;
+        write_protected(
+            &directory.join("如何手动恢复.txt"),
+            BREAK_GLASS_README.as_bytes(),
+        )
+    }
+
+    fn break_glass_directory(&self, tool: &str) -> Result<PathBuf> {
+        if !allowed(tool) {
+            return Err(Failure::Invalid);
+        }
+        Ok(self.root.join("original").join(tool))
+    }
+
+    pub(crate) fn remove(&self, tool: &str) -> Result<()> {
+        let path = self.path(tool)?;
+        if common::snapshot_bounded(&path, MAX_JOURNAL)
+            .map_err(|_| Failure::Io)?
+            .is_some()
+        {
+            std::fs::remove_file(path).map_err(|_| Failure::Io)?;
+        }
+        // The baseline is gone, so the break-glass copy would only mislead.
+        if let Ok(directory) = self.break_glass_directory(tool) {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+        Ok(())
+    }
+
+    /// Complete only an interrupted transaction for this exact tool. A
+    /// completed baseline remains available for explicit restore and switching.
+    /// The pending receipt is removed/replaced last so partial file or
+    /// credential failures stay recoverable.
+    pub(crate) fn recover_pending(
+        &self,
+        tool: &str,
+        restore_credential: impl FnOnce() -> bool,
+    ) -> std::result::Result<bool, PendingRecoveryFailure> {
+        let Some(record) = self.load(tool).map_err(|_| PendingRecoveryFailure::Load)? else {
+            return Ok(false);
+        };
+        if !record.pending {
+            return Ok(false);
+        }
+        if record.rollback_checkpoint.is_some() {
+            restore_attempt(&record).map_err(|_| PendingRecoveryFailure::Files)?;
+        } else {
+            restore_files(&record).map_err(|_| PendingRecoveryFailure::Files)?;
+        }
+        if !restore_credential() {
+            return Err(PendingRecoveryFailure::Credential);
+        }
+        if record.rollback_checkpoint.is_some() {
+            self.abandon(&record)
+                .map_err(|_| PendingRecoveryFailure::Receipt)?;
+        } else {
+            self.remove(tool)
+                .map_err(|_| PendingRecoveryFailure::Receipt)?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn begin(
+        &self,
+        receipt: Receipt,
+        changes: &[FileChange],
+        legacy: Option<&ToolCredential>,
+    ) -> Result<Record> {
+        let previous = self.load(&receipt.tool_id)?;
+        if previous.as_ref().is_some_and(|r| r.pending) {
+            return Err(Failure::Changed);
+        }
+        let mut files = changes.to_vec();
+        if let Some(previous) = &previous {
+            // A relocated custom profile must be restored first. Never abandon
+            // the original files silently or grow a cross-profile history.
+            if !same_file_set(&receipt.tool_id, &previous.files, &files)? {
+                return Err(Failure::Changed);
+            }
+            for file in &mut files {
+                // A file this tool had not written before has no baseline to
+                // rebase: what is on disk now is the user's original, except
+                // for a DSH patch that DSH 0.2 filled by importing the
+                // `settings.yaml` we wrote. That copy of our configuration is
+                // not theirs and must not come back on disconnect.
+                let Some(original) = previous.files.iter().find(|f| f.path == file.path) else {
+                    if dsh_profile_patch(&file.path) {
+                        if let Some(before) = file.before.as_deref() {
+                            file.before = Some(
+                                crate::tool_adapters::dsh_web::strip_owned_patch(before)
+                                    .map_err(|_| Failure::Invalid)?,
+                            );
+                        }
+                    }
+                    continue;
+                };
+                // Rebase unrelated or later user edits, not the old YesChoy
+                // values. This keeps the original owned values across switches.
+                file.before = restore_bytes(original, file.before.as_deref())?.0;
+            }
+        } else if let Some(credential) = legacy {
+            let owns_claude_mode = changes.iter().any(|file| {
+                document(&file.path, file.before.as_deref())
+                    .is_ok_and(|value| value["appliedId"] == "00000000-0000-4000-8000-000000157220")
+            });
+            for file in &mut files {
+                file.before = legacy_clean(
+                    &receipt.tool_id,
+                    &file.path,
+                    file.before.as_deref(),
+                    credential,
+                    owns_claude_mode,
+                )?;
+            }
+        }
+        let record = Record {
+            version: 1,
+            rollback_checkpoint: matches!(
+                receipt.tool_id.as_str(),
+                "claude_desktop" | "codex_desktop"
+            )
+            .then(|| RollbackCheckpoint {
+                files: changes.to_vec(),
+                credential: legacy.cloned(),
+            }),
+            receipt,
+            original_known: previous
+                .as_ref()
+                .map_or(legacy.is_none(), |p| p.original_known),
+            files,
+            pending: true,
+            previous: previous.map(Box::new),
+        };
+        self.save(&record)?;
+        Ok(record)
+    }
+
+    pub(crate) fn finish(&self, record: &mut Record) -> Result<()> {
+        let mut completed = record.clone();
+        completed.pending = false;
+        completed.previous = None;
+        completed.rollback_checkpoint = None;
+        self.save(&completed)?;
+        *record = completed;
+        Ok(())
+    }
+
+    pub(crate) fn abandon(&self, record: &Record) -> Result<()> {
+        if let Some(previous) = &record.previous {
+            self.save(previous)
+        } else {
+            self.remove(&record.receipt.tool_id)
+        }
+    }
+}
+
+/// Whether a new activation may take over the previous record's files.
+///
+/// The rule is "the same files", so that switching never silently abandons an
+/// original. DSH is the one tool whose file set legitimately moves between
+/// releases of the tool itself: this assistant used to write only
+/// `settings.yaml`, now writes the web profile's `cordis.patch.yml` as well,
+/// and DSH 0.2 renames `settings.yaml` away after importing it. So for DSH a
+/// file may be added, and one may be dropped only once it no longer exists,
+/// which means nothing of the user's is left in it to restore.
+fn same_file_set(tool: &str, previous: &[FileChange], next: &[FileChange]) -> Result<bool> {
+    let before = previous.iter().map(|f| &f.path).collect::<BTreeSet<_>>();
+    let after = next.iter().map(|f| &f.path).collect::<BTreeSet<_>>();
+    if before == after {
+        return Ok(true);
+    }
+    if tool != "dsh_web" {
+        return Ok(false);
+    }
+    for dropped in before.difference(&after) {
+        if common::snapshot(dropped)
+            .map_err(|_| Failure::Io)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Write a break-glass file and narrow it, in that order.
+///
+/// The narrowing has to come *after*. On unix `atomic_write` copies the
+/// target's mode onto the replacement, so tightening first would also work; on
+/// Windows the renamed temporary brings its own security descriptor, inherited
+/// from the directory, and anything set on the old target is simply gone.
+fn write_protected(path: &Path, bytes: &[u8]) -> Result<()> {
+    common::atomic_write_bounded(path, bytes, MAX_BREAK_GLASS_FILE).map_err(|_| Failure::Io)?;
+    common::restrict_to_owner(path).map_err(|_| Failure::Io)
+}
+
+fn document(path: &Path, bytes: Option<&[u8]>) -> Result<Value> {
+    let source = std::str::from_utf8(bytes.unwrap_or_default()).map_err(|_| Failure::Invalid)?;
+    if source.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    let value: Value = match path.extension().and_then(|p| p.to_str()) {
+        Some("toml") => toml_edit::de::from_str(source).map_err(|_| Failure::Invalid)?,
+        Some("yaml" | "yml") => serde_yaml::from_str(source).map_err(|_| Failure::Invalid)?,
+        _ => json5::from_str(source).map_err(|_| Failure::Invalid)?,
+    };
+    // An object always; a bare array only for WorkBuddy's catalog file and a
+    // DSH profile patch, which is a list of rows by definition.
+    let shape_is_expected = value.is_object()
+        || ((workbuddy_catalog(path) || dsh_profile_patch(path)) && value.is_array());
+    if !shape_is_expected {
+        return Err(Failure::Invalid);
+    }
+    Ok(value)
+}
+
+// Three-way merge: before = original values, after = values we wrote.
+// No change by us => leave current alone. A conflicting owned leaf => preserve
+// the user's newer value. Arrays are atomic, except keyed Claude profile lists.
+fn undo(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    current: Option<&Value>,
+    preserved: &mut bool,
+) -> Option<Value> {
+    if before == after {
+        *preserved |= current != after;
+        return current.cloned();
+    }
+    if current == before {
+        return current.cloned();
+    }
+    if current == after {
+        return before.cloned();
+    }
+    if after.is_some_and(Value::is_object)
+        && current.is_some_and(Value::is_object)
+        && before.is_none_or(Value::is_object)
+    {
+        if let (None, Some(after_value), Some(current_value)) = (before, after, current) {
+            if object_contains(current_value, after_value) {
+                return None;
+            }
+            *preserved = true;
+            return current.cloned();
+        }
+        let empty = Map::new();
+        let base = before.and_then(Value::as_object).unwrap_or(&empty);
+        let ours = after.and_then(Value::as_object).unwrap_or(&empty);
+        let mut result = current
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        *preserved |= result
+            .keys()
+            .any(|key| !base.contains_key(key) && !ours.contains_key(key));
+        for key in base.keys().chain(ours.keys()).collect::<BTreeSet<_>>() {
+            match undo(base.get(key), ours.get(key), result.get(key), preserved) {
+                Some(value) => {
+                    result.insert(key.clone(), value);
+                }
+                None => {
+                    result.remove(key);
+                }
+            }
+        }
+        return if result.is_empty() && before.is_none() {
+            None
+        } else {
+            Some(Value::Object(result))
+        };
+    }
+    // Claude's profile picker may acquire entries from another tool after setup.
+    let empty_array = Vec::new();
+    let base_array = before
+        .and_then(Value::as_array)
+        .or_else(|| before.is_none().then_some(&empty_array));
+    if let (Some(base), Some(Value::Array(ours)), Some(Value::Array(now))) =
+        (base_array, after, current)
+    {
+        if base
+            .iter()
+            .chain(ours)
+            .chain(now)
+            .all(|v| v.get("id").and_then(Value::as_str).is_some())
+        {
+            let mut result = now.clone();
+            *preserved |= now.iter().any(|v| !ours.iter().any(|a| a["id"] == v["id"]));
+            let ids = base
+                .iter()
+                .chain(ours)
+                .filter_map(|v| v["id"].as_str())
+                .collect::<BTreeSet<_>>();
+            for id in ids {
+                let b = base.iter().find(|v| v["id"] == id);
+                let a = ours.iter().find(|v| v["id"] == id);
+                let n = now.iter().find(|v| v["id"] == id);
+                let restored = undo(b, a, n, preserved);
+                if let Some(index) = result.iter().position(|v| v["id"] == id) {
+                    if let Some(value) = restored {
+                        result[index] = value;
+                    } else {
+                        result.remove(index);
+                    }
+                } else if let Some(value) = restored {
+                    result.push(value);
+                }
+            }
+            return Some(Value::Array(result));
+        }
+    }
+    *preserved = true;
+    current.cloned()
+}
+
+fn object_contains(current: &Value, required: &Value) -> bool {
+    match (current, required) {
+        (Value::Object(now), Value::Object(need)) => need.iter().all(|(key, value)| {
+            now.get(key)
+                .is_some_and(|have| object_contains(have, value))
+        }),
+        (now, need) => now == need,
+    }
+}
+
+fn dsh_profile_patch(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "cordis.patch.yml")
+}
+
+fn workbuddy_catalog(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "models.json")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".workbuddy")
+}
+
+fn json_string_set(value: Option<&Value>) -> BTreeSet<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn remove_inserted_available_models(before: &Value, after: &Value, mut restored: Value) -> Value {
+    let Some(available) = restored
+        .as_object_mut()
+        .and_then(|object| object.get_mut("availableModels"))
+        .and_then(Value::as_array_mut)
+    else {
+        return restored;
+    };
+    let inserted = json_string_set(after.get("availableModels"))
+        .difference(&json_string_set(before.get("availableModels")))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if inserted.is_empty() {
+        return restored;
+    }
+    available.retain(|value| {
+        value
+            .as_str()
+            .map(|id| !inserted.contains(id))
+            .unwrap_or(true)
+    });
+    restored
+}
+
+fn toml_patch(
+    table: &mut dyn toml_edit::TableLike,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+) -> Result<()> {
+    for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+        if before.get(key) == after.get(key) {
+            continue;
+        }
+        match after.get(key) {
+            None => {
+                table.remove(key);
+            }
+            Some(Value::Object(next))
+                if table
+                    .get(key)
+                    .and_then(toml_edit::Item::as_table_like)
+                    .is_some()
+                    && before.get(key).is_some_and(Value::is_object) =>
+            {
+                toml_patch(
+                    table
+                        .get_mut(key)
+                        .and_then(toml_edit::Item::as_table_like_mut)
+                        .ok_or(Failure::Invalid)?,
+                    before[key].as_object().ok_or(Failure::Invalid)?,
+                    next,
+                )?;
+            }
+            Some(value) => {
+                let mut wrapper = Map::new();
+                wrapper.insert(key.clone(), value.clone());
+                let mut parsed =
+                    toml_edit::ser::to_document(&wrapper).map_err(|_| Failure::Invalid)?;
+                let mut replacement = parsed.as_table_mut().remove(key).ok_or(Failure::Invalid)?;
+                if let Some(existing) = table.get_mut(key) {
+                    if let (Some(old), Some(next)) =
+                        (existing.as_value(), replacement.as_value_mut())
+                    {
+                        *next.decor_mut() = old.decor().clone();
+                    }
+                    *existing = replacement;
+                } else {
+                    table.insert(key, replacement);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn serialize(path: &Path, current: Option<&[u8]>, value: &Value) -> Result<Vec<u8>> {
+    match path.extension().and_then(|p| p.to_str()) {
+        Some("toml") => {
+            let source =
+                std::str::from_utf8(current.unwrap_or_default()).map_err(|_| Failure::Invalid)?;
+            let mut doc = source
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|_| Failure::Invalid)?;
+            let old = document(path, current)?;
+            toml_patch(
+                doc.as_table_mut(),
+                old.as_object().ok_or(Failure::Invalid)?,
+                value.as_object().ok_or(Failure::Invalid)?,
+            )?;
+            Ok(doc.to_string().into_bytes())
+        }
+        Some("yaml" | "yml") => serde_yaml::to_string(value)
+            .map(String::into_bytes)
+            .map_err(|_| Failure::Invalid),
+        _ => serde_json::to_vec_pretty(value).map_err(|_| Failure::Invalid),
+    }
+}
+
+pub(crate) fn restore_bytes(
+    file: &FileChange,
+    current: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, bool)> {
+    if current == file.before.as_deref() {
+        return Ok((current.map(Vec::from), false));
+    }
+    if current == Some(file.after.as_slice()) {
+        return Ok((file.before.clone(), false));
+    }
+    if current.is_none() {
+        return Ok((None, true));
+    } // Respect a user's deletion.
+    if let Some(restored) = crate::tool_adapters::dsh_web::restore_credentials(
+        &file.path,
+        file.before.as_deref(),
+        &file.after,
+        current.unwrap_or_default(),
+    ) {
+        let (document, preserved) = restored.map_err(|_| Failure::Invalid)?;
+        let Some(document) = document else {
+            return Ok((None, preserved));
+        };
+        if document == self::document(&file.path, current)? {
+            return Ok((current.map(Vec::from), preserved));
+        }
+        return Ok((Some(serialize(&file.path, current, &document)?), preserved));
+    }
+    if let Some(restored) = crate::tool_adapters::dsh_web::restore_profile_patch(
+        &file.path,
+        file.before.as_deref(),
+        &file.after,
+        current.unwrap_or_default(),
+    ) {
+        let (rows, preserved) = restored.map_err(|_| Failure::Invalid)?;
+        if rows.is_empty() && file.before.is_none() {
+            return Ok((None, preserved));
+        }
+        let now = document(&file.path, current)?;
+        if Value::Array(rows.clone()) == now {
+            return Ok((current.map(Vec::from), preserved));
+        }
+        return Ok((
+            Some(serialize(&file.path, current, &Value::Array(rows))?),
+            preserved,
+        ));
+    }
+    // Hermes 的 `config.yaml` 是用户手写的，带注释：按文本把 `model:` 那一块
+    // 换回去。下面通用的那条路会整份重排，注释就没了。
+    if let Some(restored) = crate::tool_adapters::hermes::restore(
+        &file.path,
+        file.before.as_deref(),
+        &file.after,
+        current.unwrap_or_default(),
+    ) {
+        return Ok(restored);
+    }
+    let before = document(&file.path, file.before.as_deref())?;
+    let after = document(&file.path, Some(&file.after))?;
+    let mut now = document(&file.path, current)?;
+    // Cline 每次运行都会改它正在用的那一项的 `updatedAt`；那不是用户的改动。
+    let touched = now.clone();
+    crate::tool_adapters::cline::forget_touch(&file.path, &after, &mut now);
+    let mut preserved = false;
+    // A first-time WorkBuddy catalog is written as a top-level array. Treat
+    // the missing file as an empty keyed array during a later hot-reload
+    // merge; coercing it to `{}` makes `undo` preserve the entire current
+    // array and leaves our scoped API keys behind on disconnect.
+    let semantic_before =
+        if file.before.is_none() && workbuddy_catalog(&file.path) && after.is_array() {
+            None
+        } else {
+            Some(&before)
+        };
+    // `None` from `undo` means "there was no file": WorkBuddy reformats its
+    // first-use catalog (drops the trailing newline), so the bytes differ from
+    // ours while the content is still exactly what we wrote.
+    let Some(mut restored) = undo(semantic_before, Some(&after), Some(&now), &mut preserved) else {
+        return if file.before.is_none() {
+            Ok((None, preserved))
+        } else {
+            Err(Failure::Invalid)
+        };
+    };
+    if workbuddy_catalog(&file.path) {
+        restored = remove_inserted_available_models(&before, &after, restored);
+    }
+    crate::tool_adapters::cline::keep_what_is_not_ours(
+        &file.path,
+        &before,
+        &after,
+        &now,
+        &mut restored,
+        &mut preserved,
+    );
+    crate::tool_adapters::openclaw::settle_restored(
+        &before,
+        &after,
+        &now,
+        &mut restored,
+        &mut preserved,
+    );
+    if restored == now || restored == touched {
+        return Ok((current.map(Vec::from), preserved));
+    }
+    if file.before.is_none()
+        && (restored.as_object().is_some_and(Map::is_empty)
+            || (workbuddy_catalog(&file.path) && restored.as_array().is_some_and(Vec::is_empty)))
+    {
+        return Ok((None, preserved));
+    }
+    Ok((Some(serialize(&file.path, current, &restored)?), preserved))
+}
+
+pub(crate) fn restore_files(record: &Record) -> Result<bool> {
+    restore_files_inner(record, false)
+}
+
+// Restoring an interrupted switch is not the user's explicit "disconnect and
+// restore original settings" action. Never remove the preceding good setup.
+pub(crate) fn restore_attempt(record: &Record) -> Result<bool> {
+    let checkpoint = record
+        .rollback_checkpoint
+        .as_ref()
+        .ok_or(Failure::Invalid)?;
+    let mut attempt = record.clone();
+    attempt.files = checkpoint.files.clone();
+    attempt.previous = None;
+    attempt.rollback_checkpoint = None;
+    attempt.pending = false;
+    restore_files_inner(&attempt, true)
+}
+
+fn owned_values_restored(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    restored: Option<&Value>,
+) -> bool {
+    if before == after || before == restored {
+        return true;
+    }
+    let empty = Map::new();
+    fn object(value: Option<&Value>) -> Option<&Map<String, Value>> {
+        value.and_then(Value::as_object)
+    }
+    if let (Some(before), Some(after), Some(restored)) = (
+        object(before).or_else(|| before.is_none().then_some(&empty)),
+        object(after).or_else(|| after.is_none().then_some(&empty)),
+        object(restored).or_else(|| restored.is_none().then_some(&empty)),
+    ) {
+        return before
+            .keys()
+            .chain(after.keys())
+            .all(|key| owned_values_restored(before.get(key), after.get(key), restored.get(key)));
+    }
+    // Match the keyed-array merge used by `undo`: a third-party Claude
+    // profile added during startup is not an owned-field recovery conflict.
+    let empty_array = Vec::new();
+    fn array(value: Option<&Value>) -> Option<&Vec<Value>> {
+        value.and_then(Value::as_array)
+    }
+    if let (Some(before), Some(after), Some(restored)) = (
+        array(before).or_else(|| before.is_none().then_some(&empty_array)),
+        array(after).or_else(|| after.is_none().then_some(&empty_array)),
+        array(restored).or_else(|| restored.is_none().then_some(&empty_array)),
+    ) {
+        let unique_ids = |values: &[Value]| {
+            let ids = values
+                .iter()
+                .filter_map(|v| v.get("id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>();
+            ids.len() == values.len()
+        };
+        if [before, after, restored]
+            .iter()
+            .all(|values| unique_ids(values))
+        {
+            return before.iter().chain(after).all(|entry| {
+                let id = &entry["id"];
+                owned_values_restored(
+                    before.iter().find(|value| &value["id"] == id),
+                    after.iter().find(|value| &value["id"] == id),
+                    restored.iter().find(|value| &value["id"] == id),
+                )
+            });
+        }
+    }
+    false
+}
+
+fn restore_files_inner(record: &Record, require_owned_restored: bool) -> Result<bool> {
+    // DSH's own writers (its Models page, the model picker, Desktop's startup)
+    // take these locks; holding them from the first snapshot to the last write
+    // keeps a concurrent DSH edit from landing in between.
+    let paths = record
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let _dsh_locks =
+        crate::tool_adapters::dsh_web::lock_for_restore(&paths).map_err(|_| Failure::Changed)?;
+    // Plan every file before changing any. An invalid document must not cause
+    // half of an otherwise valid restoration to be applied.
+    let mut plan = Vec::new();
+    let mut preserved = false;
+    for file in &record.files {
+        let current = common::snapshot(&file.path).map_err(|_| Failure::Io)?;
+        let (mut desired, kept) = restore_bytes(file, current.as_deref())?;
+        preserved |= kept;
+        // If a switch crashed before writing this file it may still contain
+        // the previous receipt, not the pending receipt.
+        if record.pending {
+            if let Some(previous) = record
+                .previous
+                .as_ref()
+                .and_then(|p| p.files.iter().find(|f| f.path == file.path))
+            {
+                let (previous_desired, kept) = restore_bytes(previous, desired.as_deref())?;
+                desired = previous_desired;
+                preserved |= kept;
+            }
+        }
+        if require_owned_restored
+            && !owned_values_restored(
+                file.before
+                    .as_deref()
+                    .map(|bytes| document(&file.path, Some(bytes)))
+                    .transpose()?
+                    .as_ref(),
+                Some(&document(&file.path, Some(&file.after))?),
+                desired
+                    .as_deref()
+                    .map(|bytes| document(&file.path, Some(bytes)))
+                    .transpose()?
+                    .as_ref(),
+            )
+        {
+            return Err(Failure::Changed);
+        }
+        plan.push((file.path.clone(), current, desired));
+    }
+    for (path, current, desired) in plan {
+        if common::snapshot(&path).map_err(|_| Failure::Io)? != current {
+            return Err(Failure::Changed);
+        }
+        common::restore(&path, desired.as_deref()).map_err(|_| Failure::Io)?;
+        if common::snapshot(&path).map_err(|_| Failure::Io)? != desired {
+            return Err(Failure::Io);
+        }
+    }
+    Ok(preserved)
+}
+
+/// 文件是不是还是接入时写下的那样。一字不差当然算；Cline、Hermes、OpenClaw
+/// 的设置文件它们自己和用户平时都会改，看的是我们写的那一块还在不在、还是不是
+/// 那个样子，别处动了不算。
+pub(crate) fn configuration_matches(record: &Record) -> bool {
+    record.files.iter().all(|file| {
+        let Some(current) = common::snapshot(&file.path).ok().flatten() else {
+            return false;
+        };
+        current == file.after || still_ours(&file.path, &file.after, &current)
+    })
+}
+
+fn still_ours(path: &Path, ours: &[u8], now: &[u8]) -> bool {
+    use crate::tool_adapters::{cline, hermes, openclaw};
+    cline::still_ours(path, ours, now)
+        .or_else(|| hermes::still_ours(path, ours, now))
+        .or_else(|| openclaw::still_ours(ours, now))
+        .unwrap_or(false)
+}
+
+/// 这份配置里的取密钥命令换成客户端现在的位置之后的样子。不用换、认不出来都是
+/// `None`。除了那条路径，一个字节都不动。
+fn followed_bytes(
+    tool: &str,
+    path: &Path,
+    bytes: &[u8],
+    current: &Path,
+    quote: fn(&str) -> String,
+) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if path.extension().and_then(|p| p.to_str()) == Some("toml") {
+        let mut document: toml_edit::DocumentMut = text.parse().ok()?;
+        let providers = document.get_mut("model_providers")?.as_table_like_mut()?;
+        let mut changed = false;
+        for (_, provider) in providers.iter_mut() {
+            let Some(auth) = provider.get_mut("auth") else {
+                continue;
+            };
+            let ours = auth
+                .get("args")
+                .and_then(toml_edit::Item::as_array)
+                .is_some_and(|args| {
+                    args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>()
+                        == [Some("credential-helper"), Some(tool)]
+                });
+            let Some(old) = auth.get("command").and_then(toml_edit::Item::as_str) else {
+                continue;
+            };
+            if !ours || !crate::legacy::should_follow(Path::new(old), current) {
+                continue;
+            }
+            auth["command"] = toml_edit::value(current.to_str()?);
+            changed = true;
+        }
+        return changed.then(|| document.to_string().into_bytes());
+    }
+    let value: Value = serde_json::from_str(text).ok()?;
+    let commands: Vec<&str> = match tool {
+        "claude_code" => value["apiKeyHelper"].as_str().into_iter().collect(),
+        "pi" => value["providers"]
+            .as_object()
+            .into_iter()
+            .flat_map(|providers| providers.values())
+            .filter_map(|provider| provider["apiKey"].as_str()?.strip_prefix('!'))
+            .collect(),
+        _ => return None,
+    };
+    // 按 JSON 里实际写的样子（转义后）整段替换，文件的缩进和别的字段原样不动。
+    let written = |command: &str| {
+        let encoded = serde_json::to_string(command).ok()?;
+        Some(encoded[1..encoded.len() - 1].to_owned())
+    };
+    let mut next = text.to_owned();
+    let mut changed = false;
+    for command in commands {
+        let Some(followed) = crate::legacy::followed_command(command, tool, current, quote) else {
+            continue;
+        };
+        let (old, new) = (written(command)?, written(&followed)?);
+        if !next.contains(&old) {
+            return None;
+        }
+        next = next.replace(&old, &new);
+        changed = true;
+    }
+    changed.then(|| next.into_bytes())
+}
+
+/// 客户端改了名或挪了位置之后，把已接入应用里的取密钥命令改成现在的位置。
+///
+/// 只在“应用里现在的配置”和“我们上次写的配置”除了那条路径以外完全相同时才动：
+/// 用户或别的工具改过的文件不碰，留给界面照常报“要修”。写文件和更新记录之间
+/// 断电也没关系——下次启动两边仍然只差那条路径，会接着做完。
+fn follow_helper(
+    store: &Store,
+    tool: &str,
+    current: &Path,
+    quote: fn(&str) -> String,
+) -> Result<bool> {
+    let Some(mut record) = store.load(tool)? else {
+        return Ok(false);
+    };
+    if record.pending || record.previous.is_some() || record.rollback_checkpoint.is_some() {
+        return Ok(false);
+    }
+    let settle = |path: &Path, bytes: &[u8]| {
+        followed_bytes(tool, path, bytes, current, quote).unwrap_or_else(|| bytes.to_vec())
+    };
+    let mut writes = Vec::new();
+    let mut recorded = false;
+    for file in &mut record.files {
+        let Some(live) = common::snapshot(&file.path).map_err(|_| Failure::Io)? else {
+            return Ok(false);
+        };
+        let target = settle(&file.path, &file.after);
+        if settle(&file.path, &live) != target {
+            return Ok(false);
+        }
+        if live != target {
+            writes.push((file.path.clone(), live, target.clone()));
+        }
+        if file.after != target {
+            file.after = target;
+            recorded = true;
+        }
+    }
+    if writes.is_empty() && !recorded {
+        return Ok(false);
+    }
+    // 写之前再看一眼：读完之后应用自己又存过设置的，这次不动它，也不记，下次
+    // 启动再比。和接入时写文件用的是同一套（变了就不写，写到一半出错就退回）。
+    let mut staged: Option<common::FileTransaction> = None;
+    for (path, live, target) in writes {
+        match staged.as_mut() {
+            Some(transaction) => transaction.push_with_snapshot(path, Some(live), target),
+            None => common::FileTransaction::stage_with_snapshot(path, Some(live), target)
+                .map(|transaction| staged = Some(transaction)),
+        }
+        .map_err(|_| Failure::Io)?;
+    }
+    if let Some(mut transaction) = staged {
+        match transaction.commit() {
+            Ok(()) => {}
+            Err(common::ConfigFailure::ExternalChange) => return Ok(false),
+            Err(_) => return Err(Failure::Io),
+        }
+    }
+    if recorded {
+        store.save(&record)?;
+    }
+    Ok(true)
+}
+
+/// 启动时做一次。开发构建不做：不然在开发机上跑一下，就会把正式安装的那份
+/// 客户端接好的应用改成指向开发目录里的程序。
+pub(crate) fn follow_client_location() {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Ok(current) = crate::tool_credentials::executable_path() else {
+        return;
+    };
+    let Ok(_lock) = operation_lock() else {
+        return;
+    };
+    let Ok(Some(store)) = Store::open(false) else {
+        return;
+    };
+    for tool in ["claude_code", "pi", "codex_desktop"] {
+        let outcome = match follow_helper(
+            &store,
+            tool,
+            Path::new(&current),
+            crate::tool_credentials::shell_quote,
+        ) {
+            Ok(true) => "followed",
+            Ok(false) => "unchanged",
+            Err(_) => "failed",
+        };
+        log::info!("legacy stage=helper tool={tool} outcome={outcome}");
+    }
+}
+
+/// Detects receipts whose endpoint architecture changed across releases.
+/// Retired Codex/Pi/DSH loopbacks move to direct relay access; previous direct
+/// Claude Code receipts move to the compatibility pass-through that normalizes
+/// native picker markers. Byte-identical stale settings must still be re-applied.
+///
+/// Two more shapes since 0.4.24, both of which pass `configuration_matches`
+/// (the live file is exactly what the old release wrote) yet fail today's
+/// `validate_settings`, so the list said "connected" and "open" answered
+/// `settings_changed` with no way out:
+///
+///   * A 0.4.23 Codex receipt points `base_url` straight at the relay origin
+///     (`https://yeschoy.com/v1`); 0.4.24 requires the local bridge.
+///   * A Claude Desktop profile minted before the route rename still carries
+///     `anthropic/claude-router-<hex>` aliases; readback recomputes the routes.
+///
+/// Reporting is all this does. The user's files are never rewritten here.
+pub(crate) fn requires_gateway_migration(tool: &str, record: &Record) -> bool {
+    if tool == "claude_code" {
+        return record.files.iter().any(|file| {
+            serde_json::from_slice::<Value>(&file.after)
+                .ok()
+                .and_then(|value| {
+                    value["env"]["ANTHROPIC_BASE_URL"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .is_some_and(|origin| {
+                    matches!(
+                        origin.as_str(),
+                        "https://yeschoy.com" | "https://api.yeschoy.com"
+                    )
+                })
+        });
+    }
+    if tool == "claude_desktop" {
+        return record.files.iter().any(|file| {
+            serde_json::from_slice::<Value>(&file.after)
+                .ok()
+                .and_then(|value| value["inferenceModels"].as_array().cloned())
+                .is_some_and(|models| {
+                    models.iter().any(|model| {
+                        model["name"].as_str().is_some_and(|route| {
+                            route
+                                .starts_with(crate::tool_model_profile::CLAUDE_GATEWAY_ROUTE_PREFIX)
+                        })
+                    })
+                })
+        });
+    }
+    if tool == "codex_desktop" && codex_receipt_points_at_relay_directly(record) {
+        return true;
+    }
+    let needle = match tool {
+        "codex_desktop" => "127.0.0.1:15722",
+        "pi" | "dsh_web" => "127.0.0.1:15730",
+        _ => return false,
+    };
+    record
+        .files
+        .iter()
+        .any(|file| std::str::from_utf8(&file.after).is_ok_and(|text| text.contains(needle)))
+}
+
+/// The 0.4.23 Codex shape: the active provider's `base_url` is the relay
+/// origin plus `/v1`, with no local bridge in between.
+///
+/// Only the provider `model_provider` names is consulted, like
+/// `codex_desktop::config_points_at_our_bridge`: a user's config commonly keeps
+/// several providers, and the receipt is about the one we made active.
+fn codex_receipt_points_at_relay_directly(record: &Record) -> bool {
+    record
+        .files
+        .iter()
+        .filter(|file| file.path.extension().is_some_and(|ext| ext == "toml"))
+        .any(|file| {
+            let Ok(value) = document(&file.path, Some(&file.after)) else {
+                return false;
+            };
+            let Some(active) = value["model_provider"].as_str() else {
+                return false;
+            };
+            value["model_providers"][active]["base_url"]
+                .as_str()
+                .is_some_and(|base_url| {
+                    matches!(
+                        base_url,
+                        "https://yeschoy.com/v1" | "https://api.yeschoy.com/v1"
+                    )
+                })
+        })
+}
+
+fn remove_at(root: &mut Value, path: &[&str]) {
+    if let Some((last, parents)) = path.split_last() {
+        let mut node = root;
+        for key in parents {
+            let Some(next) = node.get_mut(*key) else {
+                return;
+            };
+            node = next;
+        }
+        if let Some(object) = node.as_object_mut() {
+            object.remove(*last);
+        }
+    }
+}
+
+/// A legacy cleanup never invents previous models, credentials or providers.
+/// Only exact adapter-owned YesChoy identities are eligible for removal.
+pub(crate) fn legacy_clean(
+    tool: &str,
+    path: &Path,
+    bytes: Option<&[u8]>,
+    credential: &ToolCredential,
+    owns_claude_mode: bool,
+) -> Result<Option<Vec<u8>>> {
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    if matches!(tool, "dsh_web" | "dsh_desktop") && dsh_profile_patch(path) {
+        return crate::tool_adapters::dsh_web::strip_owned_patch(bytes)
+            .map(Some)
+            .map_err(|_| Failure::Invalid);
+    }
+    let mut value = document(path, Some(bytes))?;
+    let original = value.clone();
+    let origin_v1 = crate::provider_presets::openai_base(&credential.origin);
+    let helper_matches = |value: &Value| {
+        value.as_str().is_some_and(|s| {
+            s.ends_with(&format!("credential-helper {tool}"))
+                || (tool == "claude_code" && s.ends_with("gateway-credential-helper claude_code"))
+        })
+    };
+    match tool {
+        "codex_desktop" => {
+            // The old catalog has no authenticated ownership receipt. Preserve
+            // it, but remove its reference; an orphan file is safer than data loss.
+            if path
+                .file_name()
+                .is_some_and(|s| s == "yeschoy-model-catalog.json")
+            {
+                return Ok(Some(bytes.to_vec()));
+            }
+            if value["model_provider"] == "yeschoy" {
+                remove_at(&mut value, &["model_provider"]);
+                if value["model"] == credential.model_id {
+                    remove_at(&mut value, &["model"]);
+                }
+            }
+            if value["model_catalog_json"] == "yeschoy-model-catalog.json" {
+                remove_at(&mut value, &["model_catalog_json"]);
+            }
+            let provider = &value["model_providers"]["yeschoy"];
+            if (provider["base_url"] == origin_v1
+                || provider["base_url"] == crate::codex_bridge::BASE_URL)
+                && provider["auth"]["args"]
+                    == serde_json::json!(["credential-helper", "codex_desktop"])
+            {
+                remove_at(&mut value, &["model_providers", "yeschoy"]);
+            }
+        }
+        "claude_code" => {
+            let owned = helper_matches(&value["apiKeyHelper"]);
+            if owned {
+                remove_at(&mut value, &["apiKeyHelper"]);
+                for key in [
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                ] {
+                    let current = &value["env"][key];
+                    let matches = if key == "ANTHROPIC_BASE_URL" {
+                        current == &credential.origin
+                            || crate::provider_presets::anthropic_base(&credential.origin)
+                                .is_some_and(|base| current == &base)
+                            || current == "http://127.0.0.1:15728/claude-code"
+                    } else {
+                        current == &credential.model_id
+                    };
+                    if matches {
+                        remove_at(&mut value, &["env", key]);
+                    }
+                }
+            }
+        }
+        "claude_desktop" => {
+            const PROFILE: &str = "00000000-0000-4000-8000-000000157220";
+            if path.file_stem().is_some_and(|s| s == PROFILE)
+                && value["inferenceGatewayBaseUrl"] == "http://127.0.0.1:15729/claude-desktop"
+            {
+                return Ok(None);
+            }
+            if owns_claude_mode && value["deploymentMode"] == "3p" {
+                remove_at(&mut value, &["deploymentMode"]);
+            }
+            if value["appliedId"] == PROFILE {
+                remove_at(&mut value, &["appliedId"]);
+            }
+            if let Some(entries) = value.get_mut("entries").and_then(Value::as_array_mut) {
+                entries.retain(|v| v["id"] != PROFILE);
+            }
+        }
+        "pi" => {
+            let provider = &value["providers"]["yeschoy"];
+            if provider["baseUrl"] == origin_v1 && helper_matches(&provider["apiKey"]) {
+                remove_at(&mut value, &["providers", "yeschoy"]);
+            }
+            if value["defaultProvider"] == "yeschoy" {
+                remove_at(&mut value, &["defaultProvider"]);
+                if value["defaultModel"] == credential.model_id {
+                    remove_at(&mut value, &["defaultModel"]);
+                }
+            }
+        }
+        // 只拿走我们自己那块：指向本地转发的 `provider.yeschoy`，以及仍然
+        // 选着它的顶层 `model`。用户后来自己加的东西原样留下。
+        "opencode" => {
+            if value["provider"]["yeschoy"]["options"]["baseURL"]
+                == crate::opencode_bridge::PROXY_BASE
+            {
+                remove_at(&mut value, &["provider", "yeschoy"]);
+            }
+            if value["model"]
+                .as_str()
+                .is_some_and(|model| model.starts_with("yeschoy/"))
+            {
+                remove_at(&mut value, &["model"]);
+            }
+        }
+        // `model:` 还指着本地转发才拿走；用户已经换成别家的不碰。
+        "hermes" => {
+            if value["model"]["provider"] == "custom"
+                && value["model"]["base_url"] == crate::hermes_bridge::PROXY_BASE
+            {
+                remove_at(&mut value, &["model"]);
+            }
+        }
+        // 只拿走仍指着本地转发的那一家；主型号还选着它、白名单里还列着它的，
+        // 一并拿走。
+        "openclaw" => {
+            use crate::tool_adapters::openclaw::{is_ours, primary, ALLOW_ENTRY, PROVIDER_ID};
+            if value["models"]["providers"][PROVIDER_ID]["baseUrl"]
+                == crate::openclaw_bridge::PROXY_BASE
+            {
+                remove_at(&mut value, &["models", "providers", PROVIDER_ID]);
+                let model = &value["agents"]["defaults"]["model"];
+                if primary(model).is_some_and(is_ours) {
+                    if model.is_object() {
+                        remove_at(&mut value, &["agents", "defaults", "model", "primary"]);
+                    } else {
+                        remove_at(&mut value, &["agents", "defaults", "model"]);
+                    }
+                }
+                if let Some(allow) =
+                    value["agents"]["defaults"]["modelPolicy"]["allow"].as_array_mut()
+                {
+                    allow.retain(|entry| entry != ALLOW_ENTRY);
+                }
+            }
+        }
+        // 只拿走仍指着本地转发的那一项；选中的还是它，就一并取消选中。
+        "cline" => {
+            let id = crate::tool_adapters::cline::PROVIDER_ID;
+            if value["providers"][id]["settings"]["baseUrl"] == crate::cline_bridge::PROXY_BASE {
+                remove_at(&mut value, &["providers", id]);
+                if value["lastUsedProvider"] == id {
+                    remove_at(&mut value, &["lastUsedProvider"]);
+                }
+            }
+        }
+        "dsh_web" => {
+            let provider = &value["llm-pi-ai"]["providers"]["yeschoy"];
+            if provider["baseURL"] == origin_v1 && provider["apiKeyEnv"] == "YESCHOY_DSH_API_KEY" {
+                remove_at(&mut value, &["llm-pi-ai", "providers", "yeschoy"]);
+            }
+            if value["agent-default-model"]["provider"] == "yeschoy" {
+                remove_at(&mut value, &["agent-default-model", "provider"]);
+                if value["agent-default-model"]["model"] == credential.model_id {
+                    remove_at(&mut value, &["agent-default-model", "model"]);
+                }
+            }
+        }
+        "cursorpp" => {
+            if let Some(providers) = value.get_mut("providers").and_then(Value::as_array_mut) {
+                providers.retain(|p| !crate::tool_adapters::cursorpp::is_owned_provider(p));
+            }
+        }
+        "workbuddy" => {
+            let expected_url = format!(
+                "{}/chat/completions",
+                crate::provider_presets::openai_base(&credential.origin)
+            );
+            let owned = |model: &Value| {
+                let Some(id) = model.get("id").and_then(Value::as_str) else {
+                    return false;
+                };
+                let Ok(route) = credential.resolve_model(id) else {
+                    return false;
+                };
+                model.get("vendor").and_then(Value::as_str) == Some("野菜API")
+                    && model.get("url").and_then(Value::as_str) == Some(expected_url.as_str())
+                    && model.get("apiKey").and_then(Value::as_str) == Some(route.upstream_key())
+            };
+            match &mut value {
+                Value::Array(models) => models.retain(|model| !owned(model)),
+                Value::Object(object) => {
+                    let Some(models) = object.get_mut("models").and_then(Value::as_array_mut)
+                    else {
+                        return Err(Failure::Invalid);
+                    };
+                    models.retain(|model| !owned(model));
+                    if let Some(available) = object
+                        .get_mut("availableModels")
+                        .and_then(Value::as_array_mut)
+                    {
+                        available.retain(|value| {
+                            value
+                                .as_str()
+                                .map(|id| credential.resolve_model(id).is_err())
+                                .unwrap_or(true)
+                        });
+                    }
+                }
+                _ => return Err(Failure::Invalid),
+            }
+        }
+        _ => return Err(Failure::Invalid),
+    }
+    if value == original {
+        Ok(Some(bytes.to_vec()))
+    } else {
+        serialize(path, Some(bytes), &value).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    struct Fixture(Store);
+    impl Fixture {
+        fn new() -> Self {
+            Self(Store {
+                root: common::temporary_working_directory("recovery-test").unwrap(),
+                key: [42; 32],
+            })
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.root.join(name)
+        }
+        fn change(&self, name: &str, before: Option<&[u8]>, after: &[u8]) -> FileChange {
+            common::FileTransaction::stage_with_snapshot(
+                self.path(name),
+                before.map(Vec::from),
+                after.to_vec(),
+            )
+            .unwrap()
+            .changes()[0]
+                .clone()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0.root);
+        }
+    }
+    fn receipt(tool: &str) -> Receipt {
+        Receipt {
+            tool_id: tool.into(),
+            model_id: "model-new".into(),
+            line_id: "mainland_optimized".into(),
+            billing_group: "default".into(),
+            updated_at_epoch_ms: 1,
+            requires_background: false,
+        }
+    }
+    fn credential() -> ToolCredential {
+        ToolCredential {
+            pasted_key: false,
+            api_key: "synthetic-never-a-real-key".into(),
+            origin: "https://yeschoy.com".into(),
+            model_id: "model-new".into(),
+            local_gateway_token: None,
+            codex_transport: None,
+            claude_transport: None,
+            models: vec![],
+        }
+    }
+    fn merged(file: &FileChange, now: Value) -> (Value, bool) {
+        let (bytes, kept) = restore_bytes(file, Some(&serde_json::to_vec(&now).unwrap())).unwrap();
+        (document(&file.path, bytes.as_deref()).unwrap(), kept)
+    }
+
+    #[test]
+    fn a_dsh_profile_patch_we_created_is_removed_but_the_users_rows_stay() {
+        let fixture = Fixture::new();
+        let patch = "profiles/web/cordis.patch.yml";
+        std::fs::create_dir_all(fixture.path("profiles/web")).unwrap();
+        let after = b"- id: llm-pi-ai\n  config:\n    providers:\n      yeschoy: {baseURL: https://yeschoy.com/v1}\n- id: agent-default-model\n  config: {provider: yeschoy, model: m}\n";
+        let file = fixture.change(patch, None, after);
+        // Unchanged since we wrote it: the file goes, as it never existed.
+        assert_eq!(restore_bytes(&file, Some(after)).unwrap(), (None, false));
+        // DSH rewrote it (same values, its own formatting) and the user added
+        // a provider plus a row of their own.
+        let now = b"- id: llm-pi-ai\n  config:\n    providers:\n      yeschoy:\n        baseURL: https://yeschoy.com/v1\n      local:\n        baseURL: http://127.0.0.1:11434/v1\n- id: agent-default-model\n  config:\n    provider: yeschoy\n    model: m\n- id: ui-settings\n  config: {theme: dark}\n";
+        let (bytes, preserved) = restore_bytes(&file, Some(now)).unwrap();
+        assert!(!preserved);
+        let rows = document(&file.path, bytes.as_deref()).unwrap();
+        assert_eq!(
+            rows,
+            json!([
+                {"id": "llm-pi-ai", "config": {"providers": {"local": {"baseURL": "http://127.0.0.1:11434/v1"}}}},
+                {"id": "ui-settings", "config": {"theme": "dark"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn a_patch_dsh_filled_from_our_old_settings_is_not_taken_as_the_users() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.path("profiles/web")).unwrap();
+        let store = &fixture.0;
+        // A journaled 0.1 connection: only settings.yaml was ours.
+        let settings = fixture.change("settings.yaml", None, b"a: 1\n");
+        let mut record = store.begin(receipt("dsh_web"), &[settings], None).unwrap();
+        store.finish(&mut record).unwrap();
+        // DSH 0.2 imported it into the web patch and renamed the source.
+        let imported = b"- id: llm-pi-ai\n  config:\n    providers:\n      local: {baseURL: x}\n      yeschoy: {apiKeyEnv: YESCHOY_DSH_API_KEY, baseURL: 'https://yeschoy.com/v1'}\n- id: agent-default-model\n  config: {provider: yeschoy, model: m}\n";
+        let patch = fixture.change("profiles/web/cordis.patch.yml", Some(imported), imported);
+        let record = store.begin(receipt("dsh_web"), &[patch], None).unwrap();
+        let baseline = document(&record.files[0].path, record.files[0].before.as_deref()).unwrap();
+        assert_eq!(
+            baseline,
+            json!([{"id": "llm-pi-ai", "config": {"providers": {"local": {"baseURL": "x"}}}}])
+        );
+    }
+
+    #[test]
+    fn legacy_dsh_cleanup_covers_the_patch_dsh_imported_into() {
+        let fixture = Fixture::new();
+        let path = fixture.path("profiles/web/cordis.patch.yml");
+        let imported = b"- id: agent-default-model\n  config: {provider: yeschoy, model: m}\n";
+        let cleaned = legacy_clean("dsh_web", &path, Some(imported), &credential(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document(&path, Some(&cleaned)).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn dsh_may_gain_the_profile_patch_and_lose_a_settings_file_dsh_renamed() {
+        let fixture = Fixture::new();
+        let settings = fixture.change("settings.yaml", None, b"a: 1\n");
+        let patch = fixture.change("cordis.patch.yml", None, b"[]\n");
+        let previous = vec![settings.clone()];
+        // Added: allowed for DSH only.
+        let grown = vec![settings.clone(), patch.clone()];
+        assert!(same_file_set("dsh_web", &previous, &grown).unwrap());
+        assert!(!same_file_set("pi", &previous, &grown).unwrap());
+        // Dropped while it still exists: the user's content would be abandoned.
+        std::fs::write(fixture.path("settings.yaml"), b"a: 1\n").unwrap();
+        assert!(!same_file_set("dsh_web", &previous, std::slice::from_ref(&patch)).unwrap());
+        // Dropped after DSH 0.2 renamed it away: nothing left to restore.
+        std::fs::remove_file(fixture.path("settings.yaml")).unwrap();
+        assert!(same_file_set("dsh_web", &previous, std::slice::from_ref(&patch)).unwrap());
+        assert!(!same_file_set("pi", &previous, std::slice::from_ref(&patch)).unwrap());
+    }
+
+    #[test]
+    fn a_lost_keyring_still_leaves_the_originals_on_disk() {
+        // The sealed journal is the only copy of the user's original config —
+        // the real files already hold our values by the time it is written. If
+        // the keyring entry disappears (reset login keychain, cleared Windows
+        // credential store) nothing can decrypt it, so there is also a plain,
+        // owner-only copy and a note telling the user what to do with it.
+        let fixture = Fixture::new();
+        let existing = fixture.change("settings.json", Some(b"original-content"), b"ours");
+        let created = fixture.change("added.json", None, b"ours-too");
+        fixture
+            .0
+            .begin(
+                receipt("claude_code"),
+                &[existing.clone(), created.clone()],
+                None,
+            )
+            .unwrap();
+
+        let plain = fixture.0.root.join("original").join("claude_code");
+        assert_eq!(std::fs::read(plain.join("0")).unwrap(), b"original-content");
+        assert!(
+            !plain.join("1").exists(),
+            "a file that did not exist before activation has no copy to keep"
+        );
+        assert!(plain.join("如何手动恢复.txt").exists());
+
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(plain.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["tool"], "claude_code");
+        assert_eq!(manifest["files"][0]["copy"], "0");
+        assert_eq!(
+            manifest["files"][0]["restoreTo"],
+            existing.path.to_string_lossy().as_ref()
+        );
+        assert_eq!(manifest["files"][0]["existedBeforeActivation"], true);
+        // The instruction for the second file is "delete it", not "restore it".
+        assert_eq!(manifest["files"][1]["existedBeforeActivation"], false);
+        assert_eq!(
+            manifest["files"][1]["restoreTo"],
+            created.path.to_string_lossy().as_ref()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // These hold the user's own configuration, which may carry their own
+            // credentials. Nobody else on the machine gets to read them.
+            assert_eq!(
+                std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for name in ["0", "manifest.json", "如何手动恢复.txt"] {
+                assert_eq!(
+                    std::fs::metadata(plain.join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "{name}"
+                );
+            }
+        }
+
+        // Once the baseline is discarded the copy would only mislead.
+        fixture.0.remove("claude_code").unwrap();
+        assert!(!plain.exists());
+    }
+    #[test]
+    fn legacy_lock_only_store_does_not_require_recovery_key() {
+        let f = Fixture::new();
+        let root = f.path("legacy");
+        assert_eq!(recovery_store_is_uninitialized(&root), Ok(true));
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(recovery_store_is_uninitialized(&root), Ok(true));
+        let _guard = operation_lock_at(&root).unwrap();
+        assert_eq!(recovery_store_is_uninitialized(&root), Ok(true));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(root.join("operation.lock").is_file());
+    }
+
+    #[test]
+    fn missing_recovery_key_never_discards_existing_or_unknown_material() {
+        for name in ["pi.sealed", "pi.sealed.tmp", "unexpected.json"] {
+            let f = Fixture::new();
+            let bytes = b"synthetic-existing-recovery-material";
+            std::fs::write(f.path(name), bytes).unwrap();
+            assert_eq!(recovery_store_is_uninitialized(&f.0.root), Ok(false));
+            assert_eq!(std::fs::read(f.path(name)).unwrap(), bytes);
+        }
+        let f = Fixture::new();
+        std::fs::create_dir(f.path("unexpected-directory")).unwrap();
+        assert_eq!(recovery_store_is_uninitialized(&f.0.root), Ok(false));
+        let f = Fixture::new();
+        std::fs::create_dir(f.path("operation.lock")).unwrap();
+        assert_eq!(
+            recovery_store_is_uninitialized(&f.0.root),
+            Err(Failure::Storage)
+        );
+    }
+
+    #[test]
+    fn missing_recovery_key_requires_a_bounded_regular_operation_lock() {
+        let f = Fixture::new();
+        let lock = f.path("operation.lock");
+        std::fs::write(&lock, [0u8; 64]).unwrap();
+        assert_eq!(recovery_store_is_uninitialized(&f.0.root), Ok(true));
+        let oversized = [0u8; 65];
+        std::fs::write(&lock, oversized).unwrap();
+        assert_eq!(
+            recovery_store_is_uninitialized(&f.0.root),
+            Err(Failure::Storage)
+        );
+        assert_eq!(std::fs::read(lock).unwrap(), oversized);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_recovery_key_rejects_symlinked_store_and_lock() {
+        let f = Fixture::new();
+        let target = f.path("real");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, f.path("linked")).unwrap();
+        assert_eq!(
+            recovery_store_is_uninitialized(&f.path("linked")),
+            Err(Failure::Storage)
+        );
+        let bytes = b"synthetic-untouched-target";
+        std::fs::write(f.path("target"), bytes).unwrap();
+        std::os::unix::fs::symlink(f.path("target"), target.join("operation.lock")).unwrap();
+        assert_eq!(
+            recovery_store_is_uninitialized(&target),
+            Err(Failure::Storage)
+        );
+        assert_eq!(std::fs::read(f.path("target")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn claude_code_direct_receipts_require_the_new_compatibility_endpoint() {
+        for (origin, expected) in [
+            ("https://yeschoy.com", true),
+            ("https://api.yeschoy.com", true),
+            ("http://127.0.0.1:15728/claude-code", false),
+        ] {
+            let fixture = Fixture::new();
+            let after = serde_json::to_vec(&json!({
+                "env":{"ANTHROPIC_BASE_URL":origin}
+            }))
+            .unwrap();
+            let file = fixture.change("settings.json", None, &after);
+            let record = fixture
+                .0
+                .begin(receipt("claude_code"), &[file], None)
+                .unwrap();
+            assert_eq!(
+                requires_gateway_migration("claude_code", &record),
+                expected,
+                "{origin}"
+            );
+        }
+    }
+
+    /// 0.4.23 的 Codex 回执把 `base_url` 直接写成中转地址；0.4.24 要求经过本地
+    /// 桥。文件和回执一字不差（`configuration_matches` 为真），今天的校验却过
+    /// 不了 —— 列表显示「已连接」，「打开」回 `settings_changed`，用户没有出路。
+    /// 这里只负责把它报成「需要重新接入」，不改用户的文件。
+    #[test]
+    fn a_0423_codex_receipt_pointing_straight_at_the_relay_needs_reconnecting() {
+        for (base_url, expected) in [
+            ("https://yeschoy.com/v1", true),
+            ("https://api.yeschoy.com/v1", true),
+            (crate::tool_adapters::codex_desktop::PROXY_BASE, false),
+            ("https://api.deepseek.com", false),
+        ] {
+            let fixture = Fixture::new();
+            let after = format!(
+                "model_provider = \"yeschoy\"\nmodel = \"kimi-k3\"\n\n\
+                 [model_providers.yeschoy]\nname = \"yeschoy\"\n\
+                 base_url = \"{base_url}\"\nwire_api = \"responses\"\n"
+            );
+            let file = fixture.change("config.toml", None, after.as_bytes());
+            let record = fixture
+                .0
+                .begin(receipt("codex_desktop"), &[file], None)
+                .unwrap();
+            assert_eq!(
+                requires_gateway_migration("codex_desktop", &record),
+                expected,
+                "{base_url}"
+            );
+        }
+        // 只看 `model_provider` 指向的那个 provider，和桥的恢复判定同一口径：
+        // 别的 provider 里留着一条旧地址，说明不了当前生效的连接怎么走。
+        let fixture = Fixture::new();
+        let after = "model_provider = \"openai\"\n\n\
+                     [model_providers.yeschoy]\nbase_url = \"https://yeschoy.com/v1\"\n";
+        let file = fixture.change("config.toml", None, after.as_bytes());
+        let record = fixture
+            .0
+            .begin(receipt("codex_desktop"), &[file], None)
+            .unwrap();
+        assert!(!requires_gateway_migration("codex_desktop", &record));
+    }
+
+    /// 同一类问题的 Claude Desktop 版：旧版铸的 `anthropic/claude-router-<hex>`
+    /// 别名还留在回执里，而回读用新的 `claude_gateway_route_id` 重算路由。
+    #[test]
+    fn a_claude_desktop_profile_still_carrying_the_old_alias_needs_reconnecting() {
+        let legacy = crate::tool_model_profile::legacy_claude_gateway_route_id("kimi-k3");
+        let current = crate::tool_model_profile::claude_gateway_route_id("kimi-k3");
+        for (route, expected) in [(legacy.as_str(), true), (current.as_str(), false)] {
+            let fixture = Fixture::new();
+            let after = serde_json::to_vec(&json!({
+                "inferenceProvider": "gateway",
+                "inferenceModels": [{"name": route, "labelOverride": "kimi-k3", "supports1m": false}]
+            }))
+            .unwrap();
+            let file = fixture.change("profile.json", None, &after);
+            let record = fixture
+                .0
+                .begin(receipt("claude_desktop"), &[file], None)
+                .unwrap();
+            assert_eq!(
+                requires_gateway_migration("claude_desktop", &record),
+                expected,
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_baseline_authenticates_tool_key_and_bytes() {
+        let f = Fixture::new();
+        let file = f.change(
+            "settings.json",
+            Some(br#"{"secret":"synthetic-original-secret"}"#),
+            br#"{"model":"new"}"#,
+        );
+        let record = f.0.begin(receipt("pi"), &[file], None).unwrap();
+        let bytes = std::fs::read(f.0.path("pi").unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-original-secret"));
+        assert!(decode(&[41; 32], "pi", &bytes).is_err());
+        assert!(decode(&f.0.key, "dsh_web", &bytes).is_err());
+        let mut changed = bytes;
+        *changed.last_mut().unwrap() ^= 1;
+        assert!(decode(&f.0.key, "pi", &changed).is_err());
+        assert!(f.0.load("pi").unwrap().unwrap().pending);
+        f.0.abandon(&record).unwrap();
+        assert!(f.0.load("pi").unwrap().is_none());
+    }
+    #[test]
+    fn workbuddy_restore_removes_hot_reloaded_owned_models_and_available_ids() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.path(".workbuddy")).unwrap();
+        let before = json!({
+            "models": [{"id": "other", "vendor": "Other"}],
+            "availableModels": ["other"],
+            "future": {"keep": true}
+        });
+        let after = json!({
+            "models": [
+                {"id": "other", "vendor": "Other"},
+                {
+                    "id": "gpt-6-astra",
+                    "name": "Astra",
+                    "vendor": "野菜API",
+                    "url": "https://yeschoy.com/v1/chat/completions",
+                    "apiKey": "synthetic-workbuddy-key",
+                    "useCustomProtocol": true
+                }
+            ],
+            "availableModels": ["other", "gpt-6-astra"],
+            "future": {"keep": true}
+        });
+        let file = f.change(
+            ".workbuddy/models.json",
+            Some(serde_json::to_vec(&before).unwrap().as_slice()),
+            &serde_json::to_vec(&after).unwrap(),
+        );
+        let now = json!({
+            "models": [
+                {"id": "other", "vendor": "Other"},
+                {
+                    "id": "gpt-6-astra",
+                    "name": "Astra",
+                    "vendor": "野菜API",
+                    "url": "https://yeschoy.com/v1/chat/completions",
+                    "apiKey": "synthetic-workbuddy-key",
+                    "useCustomProtocol": true,
+                    "temperature": 0.2
+                }
+            ],
+            "availableModels": ["other", "gpt-6-astra", "wb-extra"],
+            "future": {"keep": true}
+        });
+        let (restored, _) = merged(&file, now);
+        assert_eq!(
+            restored["models"],
+            json!([{"id": "other", "vendor": "Other"}])
+        );
+        assert_eq!(restored["availableModels"], json!(["other", "wb-extra"]));
+        assert_eq!(restored["future"]["keep"], true);
+        assert!(restored["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model.get("apiKey").is_none()));
+    }
+
+    #[test]
+    fn workbuddy_first_array_restore_removes_owned_keys_and_preserves_user_models() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.path(".workbuddy")).unwrap();
+        let owned = json!({
+            "id": "gpt-6-astra",
+            "name": "Astra",
+            "vendor": "野菜API",
+            "url": "https://yeschoy.com/v1/chat/completions",
+            "apiKey": "synthetic-workbuddy-key",
+            "useCustomProtocol": true
+        });
+        let after = serde_json::to_vec(&json!([owned])).unwrap();
+        let file = f.change(".workbuddy/models.json", None, &after);
+
+        let current_with_user_model = json!([
+            {
+                "id": "gpt-6-astra",
+                "name": "Astra",
+                "vendor": "野菜API",
+                "url": "https://yeschoy.com/v1/chat/completions",
+                "apiKey": "synthetic-workbuddy-key",
+                "useCustomProtocol": true,
+                "temperature": 0.2
+            },
+            {"id": "user-model", "vendor": "Other", "apiKey": "user-owned"}
+        ]);
+        let (restored, preserved) = merged(&file, current_with_user_model);
+        assert!(preserved);
+        assert_eq!(
+            restored,
+            json!([{"id": "user-model", "vendor": "Other", "apiKey": "user-owned"}])
+        );
+
+        let current_with_only_hot_reload = serde_json::to_vec(&json!([{
+            "id": "gpt-6-astra",
+            "name": "Astra",
+            "vendor": "野菜API",
+            "url": "https://yeschoy.com/v1/chat/completions",
+            "apiKey": "synthetic-workbuddy-key",
+            "useCustomProtocol": true,
+            "temperature": 0.2
+        }]))
+        .unwrap();
+        let (restored, preserved) =
+            restore_bytes(&file, Some(&current_with_only_hot_reload)).unwrap();
+        assert!(
+            restored.is_none(),
+            "the first-use catalog should be removed"
+        );
+        assert!(!preserved);
+    }
+
+    #[test]
+    fn cursorpp_restore_takes_out_our_provider_and_keeps_what_the_user_added() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.path(".ccursor")).unwrap();
+        let mine = json!({"id": "mine", "name": "Mine", "type": "anthropic", "models": []});
+        let ours = json!({
+            "id": "yeschoy",
+            "name": "野菜API",
+            "type": "openai-chat",
+            "baseUrl": "https://yeschoy.com/v1",
+            "auth": {"kind": "apiKey", "value": "synthetic-cursorpp-key"},
+            "models": [{"id": "glm-5.3-flash", "apiModel": "glm-5.3-flash"}]
+        });
+        let before =
+            serde_json::to_vec(&json!({"$schemaVersion": 1, "providers": [mine]})).unwrap();
+        let after =
+            serde_json::to_vec(&json!({"$schemaVersion": 1, "providers": [ours, mine]})).unwrap();
+        let file = f.change(".ccursor/providers.json", Some(&before), &after);
+        let later = json!({"id": "later", "name": "Later", "type": "gemini", "models": []});
+        let (restored, preserved) = merged(
+            &file,
+            json!({"$schemaVersion": 1, "providers": [ours, mine, later]}),
+        );
+        assert!(preserved);
+        assert_eq!(
+            restored,
+            json!({"$schemaVersion": 1, "providers": [mine, later]})
+        );
+
+        let first = f.change(".ccursor/providers.json", None, &after);
+        let (restored, _) = restore_bytes(&first, Some(&after)).unwrap();
+        assert!(restored.is_none(), "a file we created goes away again");
+    }
+
+    #[test]
+    fn workbuddy_first_array_restore_removes_a_catalog_only_reformatted_by_workbuddy() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.path(".workbuddy")).unwrap();
+        let catalog = json!([{
+            "id": "glm-5.3",
+            "name": "YesChoy",
+            "vendor": "野菜API",
+            "url": "https://yeschoy.com/v1/chat/completions",
+            "apiKey": "synthetic-workbuddy-key",
+            "useCustomProtocol": true
+        }]);
+        let mut after = serde_json::to_vec_pretty(&catalog).unwrap();
+        after.push(b'\n');
+        let file = f.change(".workbuddy/models.json", None, &after);
+        let rewritten = &after[..after.len() - 1];
+        let (restored, preserved) = restore_bytes(&file, Some(rewritten)).unwrap();
+        assert!(
+            restored.is_none(),
+            "the first-use catalog should be removed"
+        );
+        assert!(!preserved);
+    }
+
+    /// Cline 每跑一次就把它在用的那一项的 `updatedAt` 改掉。改回原样时这不算
+    /// 用户的改动：原来没有文件就删掉文件，原来有就一字不差地还回去。
+    #[test]
+    fn cline_restore_ignores_the_timestamp_cline_itself_rewrites() {
+        use crate::tool_adapters::cline;
+        let f = Fixture::new();
+        let name = ".cline/data/settings/providers.json";
+        let token = format!("ycg-{}", "a".repeat(64));
+        let touch = |bytes: &[u8]| {
+            let mut value: Value = serde_json::from_slice(bytes).unwrap();
+            value["providers"][cline::PROVIDER_ID]["updatedAt"] = "2030-01-01T00:00:00.000Z".into();
+            serde_json::to_vec_pretty(&value).unwrap()
+        };
+
+        let after = cline::render(None, "glm-5.3", &token, "2026-01-02T03:04:05.678Z").unwrap();
+        let file = f.change(name, None, &after);
+        assert_eq!(
+            restore_bytes(&file, Some(&touch(&after))).unwrap(),
+            (None, false)
+        );
+
+        let original = br#"{"version":1,"lastUsedProvider":"anthropic","modes":{},"providers":{"anthropic":{"settings":{"provider":"anthropic"},"updatedAt":"2026-01-01T00:00:00.000Z","tokenSource":"manual"}}}"#;
+        let after = cline::render(
+            Some(original),
+            "glm-5.3",
+            &token,
+            "2026-01-02T03:04:05.678Z",
+        )
+        .unwrap();
+        let file = f.change(name, Some(original), &after);
+        let (restored, kept) = restore_bytes(&file, Some(&touch(&after))).unwrap();
+        assert!(!kept);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&restored.unwrap()).unwrap(),
+            serde_json::from_slice::<Value>(original).unwrap()
+        );
+
+        // 用户后来在 Cline 里换了别家：选中的那家是他的决定，留着；我们那一项拿走。
+        let mut switched: Value = serde_json::from_slice(&touch(&after)).unwrap();
+        switched["lastUsedProvider"] = "cline".into();
+        let (value, kept) = merged(&file, switched);
+        assert!(kept);
+        assert_eq!(value["lastUsedProvider"], "cline");
+        assert!(value["providers"][cline::PROVIDER_ID].is_null());
+        assert!(value["providers"]["anthropic"].is_object());
+    }
+
+    /// 第一次接入时 Cline 还没有设置文件，整个 `providers` 都是我们建的。
+    /// 用户之后自己在 Cline 里加的别家不是我们的：改回原样只拿走我们那一项，
+    /// 留下的文件还得是 Cline 认的样子（它要 `version` 和 `providers`）。
+    #[test]
+    fn cline_restore_keeps_providers_the_user_added_after_a_first_time_connection() {
+        use crate::tool_adapters::cline;
+        let f = Fixture::new();
+        let token = format!("ycg-{}", "a".repeat(64));
+        let after = cline::render(None, "glm-5.3", &token, "2026-01-02T03:04:05.678Z").unwrap();
+        let file = f.change(".cline/data/settings/providers.json", None, &after);
+        let theirs = serde_json::json!({
+            "settings": {"provider": "anthropic", "apiKey": "sk-ant-theirs"},
+            "updatedAt": "2026-02-01T00:00:00.000Z",
+            "tokenSource": "manual",
+        });
+
+        let mut added: Value = serde_json::from_slice(&after).unwrap();
+        added["providers"]["anthropic"] = theirs.clone();
+        let (value, kept) = merged(&file, added.clone());
+        assert!(kept);
+        assert_eq!(
+            value,
+            serde_json::json!({"version": 1, "providers": {"anthropic": theirs}})
+        );
+
+        // 加了别家，还把选中的换成了它：选中的那家也留着。
+        added["lastUsedProvider"] = "anthropic".into();
+        let (value, kept) = merged(&file, added);
+        assert!(kept);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "version": 1,
+                "lastUsedProvider": "anthropic",
+                "providers": {"anthropic": theirs},
+            })
+        );
+    }
+
+    /// Hermes 的 `config.yaml` 带注释。接入之后用户又改了别处：改回原样只把
+    /// `model:` 那一块换回去，注释和后来的改动都留着（通用的那条路会整份重排）。
+    #[test]
+    fn hermes_restore_keeps_comments_and_later_edits() {
+        use crate::tool_adapters::hermes;
+        let f = Fixture::new();
+        let token = format!("ycg-{}", "a".repeat(64));
+        let original = "# 我的设置\nmodel:\n  provider: openrouter   # 原来用这家\n  default: x\n\nterminal:\n  backend: local\n";
+        let after = hermes::render(Some(original.as_bytes()), "glm-5.3", &token).unwrap();
+        let file = f.change(".hermes/config.yaml", Some(original.as_bytes()), &after);
+
+        // 没人动过：一字不差地还回去。
+        assert_eq!(
+            restore_bytes(&file, Some(&after)).unwrap(),
+            (Some(original.as_bytes().to_vec()), false)
+        );
+
+        let later = String::from_utf8(after.clone())
+            .unwrap()
+            .replace("backend: local", "backend: docker   # 后来换的");
+        let (bytes, kept) = restore_bytes(&file, Some(later.as_bytes())).unwrap();
+        assert!(kept, "别处后来的改动留下了，要说出来");
+        assert_eq!(
+            String::from_utf8(bytes.unwrap()).unwrap(),
+            original.replace("backend: local", "backend: docker   # 后来换的")
+        );
+
+        // 只是 Hermes 把我们那一块重排了、别处没动：还回去的就是原样，不说留了改动。
+        let reordered = String::from_utf8(after.clone())
+            .unwrap()
+            .replace("  provider: custom\n", "")
+            .replace("model:\n", "model:\n  provider: custom\n");
+        let (bytes, kept) = restore_bytes(&file, Some(reordered.as_bytes())).unwrap();
+        assert!(!kept);
+        assert_eq!(String::from_utf8(bytes.unwrap()).unwrap(), original);
+
+        // 用户后来在 Hermes 里换了别家：那是他的决定，整份不动。
+        let switched = "model:\n  provider: anthropic\n  default: y\n";
+        assert_eq!(
+            restore_bytes(&file, Some(switched.as_bytes())).unwrap(),
+            (Some(switched.as_bytes().to_vec()), true)
+        );
+    }
+
+    /// 接好之后，这三个应用自己和用户平时都会改设置文件。我们写的那一块还在、
+    /// 还是那个样子，就还是「接好了」；那一块被换掉才算「被改过」。
+    #[test]
+    fn a_connection_survives_edits_that_leave_our_part_alone() {
+        use crate::tool_adapters::{cline, hermes, openclaw};
+        let f = Fixture::new();
+        let token = format!("ycg-{}", "a".repeat(64));
+        let matches = |file: &FileChange, current: &[u8]| {
+            common::atomic_write(&file.path, current).unwrap();
+            configuration_matches(&Record {
+                version: 1,
+                receipt: receipt("cline"),
+                original_known: true,
+                files: vec![file.clone()],
+                pending: false,
+                previous: None,
+                rollback_checkpoint: None,
+            })
+        };
+
+        let after = cline::render(None, "glm-5.3", &token, "2026-01-02T03:04:05.678Z").unwrap();
+        let file = f.change(".cline/data/settings/providers.json", None, &after);
+        assert!(matches(&file, &after));
+        let mut value: Value = serde_json::from_slice(&after).unwrap();
+        value["providers"][cline::PROVIDER_ID]["updatedAt"] = "2030-01-01T00:00:00.000Z".into();
+        value["providers"]["anthropic"] = json!({"settings": {"apiKey": "sk-user"}});
+        assert!(matches(&file, &serde_json::to_vec(&value).unwrap()));
+        value["lastUsedProvider"] = "anthropic".into();
+        assert!(!matches(&file, &serde_json::to_vec(&value).unwrap()));
+        value["lastUsedProvider"] = cline::PROVIDER_ID.into();
+        // `updatedAt`、`tokenSource` 少一个，Cline 就把这一项整个丢掉。
+        for field in ["updatedAt", "tokenSource"] {
+            let mut broken = value.clone();
+            broken["providers"][cline::PROVIDER_ID]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(!matches(&file, &serde_json::to_vec(&broken).unwrap()));
+        }
+        value["providers"][cline::PROVIDER_ID]["settings"]["model"] = "other".into();
+        assert!(!matches(&file, &serde_json::to_vec(&value).unwrap()));
+
+        let original = "# 我的设置\nmodel:\n  provider: openrouter\n  default: x\n\nterminal:\n  backend: local\n";
+        let after = hermes::render(Some(original.as_bytes()), "glm-5.3", &token).unwrap();
+        let file = f.change(".hermes/config.yaml", Some(original.as_bytes()), &after);
+        let text = String::from_utf8(after.clone()).unwrap();
+        assert!(matches(
+            &file,
+            text.replace("backend: local", "backend: docker").as_bytes()
+        ));
+        assert!(!matches(
+            &file,
+            text.replace("glm-5.3", "something-else").as_bytes()
+        ));
+        assert!(!matches(&file, original.as_bytes()));
+
+        let models = ["glm-5.3".to_owned(), "kimi-k3".to_owned()];
+        let after = openclaw::render(None, "glm-5.3", &models, &token).unwrap();
+        let file = f.change(".openclaw/openclaw.json", None, &after);
+        let mut value: Value = serde_json::from_slice(&after).unwrap();
+        value["meta"] = json!({"lastTouchedAt": "2030-01-01T00:00:00.000Z"});
+        value["channels"] = json!({"telegram": {"enabled": true}});
+        assert!(matches(&file, &serde_json::to_vec(&value).unwrap()));
+        let mut switched = value.clone();
+        switched["agents"]["defaults"]["model"] = json!({"primary": "yeschoy/kimi-k3"});
+        assert!(!matches(&file, &serde_json::to_vec(&switched).unwrap()));
+        let mut blocked = value.clone();
+        blocked["agents"]["defaults"]["modelPolicy"] = json!({"allow": ["openai/*"]});
+        assert!(!matches(&file, &serde_json::to_vec(&blocked).unwrap()));
+        // 白名单改成从别的文件拼进来：看不到里面，不说还接着。
+        blocked["agents"]["defaults"]["modelPolicy"] = json!({"$include": "./policy.json5"});
+        assert!(!matches(&file, &serde_json::to_vec(&blocked).unwrap()));
+        value["models"]["providers"][openclaw::PROVIDER_ID]["baseUrl"] =
+            "https://elsewhere.example/v1".into();
+        assert!(!matches(&file, &serde_json::to_vec(&value).unwrap()));
+
+        // 别的应用还是一字不差才算。
+        let file = f.change("desktop.json", None, br#"{"model":"a"}"#);
+        assert!(matches(&file, br#"{"model":"a"}"#));
+        assert!(!matches(&file, br#"{"model":"a","x":1}"#));
+    }
+
+    /// OpenClaw：没人动过就一字不差还回去（注释也在）；之后动过的，只把我们
+    /// 改的那几处改回去。
+    #[test]
+    fn openclaw_restore_puts_back_only_what_we_changed() {
+        use crate::tool_adapters::openclaw;
+        let f = Fixture::new();
+        let token = format!("ycg-{}", "a".repeat(64));
+        let models = ["glm-5.3".to_owned(), "kimi-k3".to_owned()];
+        let original = br#"{
+  // my settings
+  gateway: { port: 18789 },
+  models: { providers: { mine: { baseUrl: "http://127.0.0.1:11434/v1", models: [] } } },
+  agents: { defaults: { model: { primary: "mine/old", fallbacks: ["mine/older"] },
+                        modelPolicy: { allow: ["mine/*"] } } },
+}
+"#;
+        let after = openclaw::render(Some(original), "glm-5.3", &models, &token).unwrap();
+        let file = f.change(".openclaw/openclaw.json", Some(original), &after);
+        let before = document(&file.path, Some(original)).unwrap();
+
+        assert_eq!(
+            restore_bytes(&file, Some(&after)).unwrap(),
+            (Some(original.to_vec()), false)
+        );
+
+        // 后来改了别处（OpenClaw 自己保存时也会整份重排）：那一处留着。
+        let mut later = document(&file.path, Some(&after)).unwrap();
+        later["gateway"]["port"] = json!(19000);
+        let (bytes, _) = restore_bytes(&file, Some(later.to_string().as_bytes())).unwrap();
+        let mut expected = before.clone();
+        expected["gateway"]["port"] = json!(19000);
+        assert_eq!(document(&file.path, bytes.as_deref()).unwrap(), expected);
+
+        // 后来在 OpenClaw 里挑了我们的另一个型号、又往白名单里加了一项：我们那
+        // 一家拿走之后，主型号不能还指着它。
+        let mut picked = document(&file.path, Some(&after)).unwrap();
+        picked["agents"]["defaults"]["model"]["primary"] = json!("yeschoy/kimi-k3");
+        picked["agents"]["defaults"]["modelPolicy"]["allow"] =
+            json!(["mine/*", "yeschoy/*", "openai/*"]);
+        let (bytes, _) = restore_bytes(&file, Some(picked.to_string().as_bytes())).unwrap();
+        let restored = document(&file.path, bytes.as_deref()).unwrap();
+        assert!(restored["models"]["providers"].get("yeschoy").is_none());
+        assert_eq!(
+            restored["agents"]["defaults"]["model"],
+            json!({ "primary": "mine/old", "fallbacks": ["mine/older"] })
+        );
+        assert_eq!(
+            restored["agents"]["defaults"]["modelPolicy"]["allow"],
+            json!(["mine/*", "openai/*"])
+        );
+
+        // 后来换成了别家：那是用户的决定，主型号不动。
+        let mut switched = document(&file.path, Some(&after)).unwrap();
+        switched["agents"]["defaults"]["model"]["primary"] = json!("openai/gpt-5.4");
+        let (bytes, kept) = restore_bytes(&file, Some(switched.to_string().as_bytes())).unwrap();
+        assert!(kept);
+        let restored = document(&file.path, bytes.as_deref()).unwrap();
+        assert_eq!(
+            restored["agents"]["defaults"]["model"]["primary"],
+            "openai/gpt-5.4"
+        );
+        assert!(restored["models"]["providers"].get("yeschoy").is_none());
+    }
+
+    /// 接入前没有这份文件：没动过就删掉；之后挑过我们别的型号的，不留下一个
+    /// 指着空厂商的主型号。
+    #[test]
+    fn openclaw_restore_of_a_file_we_created_leaves_no_dangling_model() {
+        use crate::tool_adapters::openclaw;
+        let f = Fixture::new();
+        let token = format!("ycg-{}", "a".repeat(64));
+        let models = ["glm-5.3".to_owned(), "kimi-k3".to_owned()];
+        let after = openclaw::render(None, "glm-5.3", &models, &token).unwrap();
+        let file = f.change(".openclaw/openclaw.json", None, &after);
+        assert_eq!(restore_bytes(&file, Some(&after)).unwrap(), (None, false));
+
+        let mut picked = document(&file.path, Some(&after)).unwrap();
+        picked["agents"]["defaults"]["model"] = json!("yeschoy/kimi-k3");
+        picked["gateway"] = json!({ "port": 19000 });
+        let (bytes, _) = restore_bytes(&file, Some(picked.to_string().as_bytes())).unwrap();
+        assert_eq!(
+            document(&file.path, bytes.as_deref()).unwrap(),
+            json!({ "gateway": { "port": 19000 } })
+        );
+    }
+
+    /// 接入时这份设置里还没有 `models`、`agents`：这两段是我们建的，改回原样
+    /// 会整段拿走。用户之后加在里面的东西不是我们的，得留下。
+    #[test]
+    fn openclaw_restore_keeps_what_was_added_inside_sections_we_created() {
+        use crate::tool_adapters::openclaw;
+        let f = Fixture::new();
+        let token = format!("ycg-{}", "a".repeat(64));
+        let models = ["glm-5.3".to_owned(), "kimi-k3".to_owned()];
+        let mine = json!({ "baseUrl": "https://api.openai.com/v1", "models": [] });
+        for original in [
+            None,
+            Some(br#"{ "gateway": { "port": 18789 } }"#.as_slice()),
+        ] {
+            let after = openclaw::render(original, "glm-5.3", &models, &token).unwrap();
+            let file = f.change(".openclaw/openclaw.json", original, &after);
+            let mut expected = document(&file.path, original).unwrap();
+
+            // 加了一家别的厂商、一个工作区；我们写的那些一个字没动。
+            let mut later = document(&file.path, Some(&after)).unwrap();
+            later["models"]["providers"]["openai"] = mine.clone();
+            later["agents"]["defaults"]["workspace"] = json!("~/work");
+            let (bytes, kept) = restore_bytes(&file, Some(later.to_string().as_bytes())).unwrap();
+            assert!(kept);
+            expected["models"] = json!({ "providers": { "openai": mine } });
+            expected["agents"] = json!({ "defaults": { "workspace": "~/work" } });
+            assert_eq!(document(&file.path, bytes.as_deref()).unwrap(), expected);
+
+            // 用 `openclaw models set` 挑了我们的另一个型号：它还会记一条别名、
+            // 盖一个 `meta` 戳。别名跟着我们那一家走，`meta` 是它的，留着。
+            let mut picked = later.clone();
+            picked["agents"]["defaults"]["model"] = json!("yeschoy/kimi-k3");
+            picked["agents"]["defaults"]["models"] = json!({ "yeschoy/kimi-k3": {} });
+            picked["meta"] = json!({ "lastTouchedVersion": "2026.11.6" });
+            let (bytes, _) = restore_bytes(&file, Some(picked.to_string().as_bytes())).unwrap();
+            expected["meta"] = json!({ "lastTouchedVersion": "2026.11.6" });
+            assert_eq!(document(&file.path, bytes.as_deref()).unwrap(), expected);
+
+            // 往我们那一家里加了请求头、又让主 agent 自己定了我们的型号：我们那
+            // 一家整条拿走，不剩半条；主 agent 不留一个指着空厂商的型号。它别的
+            // 设置、别的 agent 都留着。
+            let mut pinned = later.clone();
+            pinned["models"]["providers"]["yeschoy"]["headers"] = json!({ "x-mine": "1" });
+            pinned["agents"]["entries"] = json!({
+                "main": { "model": "yeschoy/glm-5.3", "workspace": "~/main" },
+                "helper": { "model": "openai/gpt-5.4" },
+            });
+            let (bytes, _) = restore_bytes(&file, Some(pinned.to_string().as_bytes())).unwrap();
+            let mut kept = document(&file.path, original).unwrap();
+            kept["models"] = json!({ "providers": { "openai": mine } });
+            kept["agents"] = json!({
+                "defaults": { "workspace": "~/work" },
+                "entries": {
+                    "main": { "workspace": "~/main" },
+                    "helper": { "model": "openai/gpt-5.4" },
+                },
+            });
+            assert_eq!(document(&file.path, bytes.as_deref()).unwrap(), kept);
+
+            // 在我们那一家里删了一个型号：密钥收走之后它就是一家用不了的厂商，
+            // 一样整条拿走。把它改去指别处的，已经是用户自己的，留着。
+            let mut trimmed = later.clone();
+            trimmed["models"]["providers"]["yeschoy"]["models"] =
+                json!([{ "id": "glm-5.3", "name": "glm-5.3" }]);
+            let (bytes, _) = restore_bytes(&file, Some(trimmed.to_string().as_bytes())).unwrap();
+            let mut left = document(&file.path, original).unwrap();
+            left["models"] = json!({ "providers": { "openai": mine } });
+            left["agents"] = json!({ "defaults": { "workspace": "~/work" } });
+            assert_eq!(document(&file.path, bytes.as_deref()).unwrap(), left);
+            let mut moved = trimmed.clone();
+            moved["models"]["providers"]["yeschoy"]["baseUrl"] = json!("https://example.com/v1");
+            let (bytes, _) = restore_bytes(&file, Some(moved.to_string().as_bytes())).unwrap();
+            assert_eq!(
+                document(&file.path, bytes.as_deref()).unwrap()["models"]["providers"]["yeschoy"]
+                    ["baseUrl"],
+                "https://example.com/v1"
+            );
+
+            // 只定了型号、别的什么都没加：不留空壳。
+            let mut only = document(&file.path, Some(&after)).unwrap();
+            only["agents"]["entries"] = json!({ "main": { "model": "yeschoy/glm-5.3" } });
+            let (bytes, _) = restore_bytes(&file, Some(only.to_string().as_bytes())).unwrap();
+            assert_eq!(bytes.is_some(), original.is_some());
+            if let Some(bytes) = bytes {
+                assert_eq!(
+                    document(&file.path, Some(&bytes)).unwrap(),
+                    document(&file.path, original).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openclaw_legacy_clean_removes_only_what_points_at_our_bridge() {
+        use crate::tool_adapters::openclaw;
+        let f = Fixture::new();
+        let path = f.path(".openclaw/openclaw.json");
+        let token = format!("ycg-{}", "a".repeat(64));
+        let ours = openclaw::render(
+            Some(br#"{ gateway: { port: 18789 }, agents: { defaults: { modelPolicy: { allow: ["openai/*"] } } } }"#),
+            "glm-5.3",
+            &["glm-5.3".to_owned()],
+            &token,
+        )
+        .unwrap();
+        let cleaned = legacy_clean("openclaw", &path, Some(&ours), &credential(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            document(&path, Some(&cleaned)).unwrap(),
+            json!({
+                "gateway": { "port": 18789 },
+                "models": { "providers": {} },
+                "agents": { "defaults": { "modelPolicy": { "allow": ["openai/*"] } } },
+            })
+        );
+
+        let theirs = br#"{"models":{"providers":{"yeschoy":{"baseUrl":"https://relay.example.com/v1"}}},"agents":{"defaults":{"model":"yeschoy/x"}}}"#;
+        let cleaned = legacy_clean("openclaw", &path, Some(theirs), &credential(), false).unwrap();
+        assert_eq!(
+            document(&path, cleaned.as_deref()).unwrap(),
+            document(&path, Some(theirs)).unwrap()
+        );
+    }
+
+    #[test]
+    fn hermes_legacy_clean_removes_the_model_block_only_while_it_points_at_our_bridge() {
+        use crate::tool_adapters::hermes;
+        let f = Fixture::new();
+        let path = f.path(".hermes/config.yaml");
+        let token = format!("ycg-{}", "a".repeat(64));
+        let ours =
+            hermes::render(Some(b"terminal:\n  backend: local\n"), "glm-5.3", &token).unwrap();
+        let cleaned = legacy_clean("hermes", &path, Some(&ours), &credential(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            document(&path, Some(&cleaned)).unwrap(),
+            json!({"terminal": {"backend": "local"}})
+        );
+
+        let theirs = b"model:\n  provider: custom\n  base_url: https://relay.example.com/v1\n";
+        let cleaned = legacy_clean("hermes", &path, Some(theirs), &credential(), false).unwrap();
+        assert_eq!(
+            document(&path, cleaned.as_deref()).unwrap()["model"]["base_url"],
+            "https://relay.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn cline_legacy_clean_removes_only_the_entry_that_points_at_our_bridge() {
+        use crate::tool_adapters::cline;
+        let f = Fixture::new();
+        let path = f.path(".cline/data/settings/providers.json");
+        let token = format!("ycg-{}", "a".repeat(64));
+        let ours = cline::render(
+            Some(br#"{"providers":{"anthropic":{"settings":{"provider":"anthropic"}}}}"#),
+            "glm-5.3",
+            &token,
+            "2026-01-02T03:04:05.678Z",
+        )
+        .unwrap();
+        let cleaned = legacy_clean("cline", &path, Some(&ours), &credential(), false)
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&cleaned).unwrap();
+        assert!(value["providers"][cline::PROVIDER_ID].is_null());
+        assert!(value["lastUsedProvider"].is_null());
+        assert!(value["providers"]["anthropic"].is_object());
+
+        // 用户自己配的 OpenAI Compatible（指着别处）不是我们的，不碰。
+        let theirs = br#"{"lastUsedProvider":"openai-compatible","providers":{"openai-compatible":{"settings":{"provider":"openai-compatible","baseUrl":"https://relay.example.com/v1"}}}}"#;
+        let cleaned = legacy_clean("cline", &path, Some(theirs), &credential(), false).unwrap();
+        let value: Value = serde_json::from_slice(&cleaned.unwrap()).unwrap();
+        assert_eq!(
+            value["providers"][cline::PROVIDER_ID]["settings"]["baseUrl"],
+            "https://relay.example.com/v1"
+        );
+        assert_eq!(value["lastUsedProvider"], cline::PROVIDER_ID);
+    }
+
+    #[test]
+    fn workbuddy_legacy_clean_removes_owned_models_and_available_ids() {
+        let f = Fixture::new();
+        let credential = ToolCredential {
+            pasted_key: false,
+            api_key: "synthetic-workbuddy-key".into(),
+            origin: "https://yeschoy.com".into(),
+            model_id: "gpt-6-astra".into(),
+            local_gateway_token: None,
+            claude_transport: None,
+            codex_transport: None,
+            models: vec![],
+        };
+        let bytes = serde_json::to_vec(&json!({
+            "models": [
+                {"id": "other", "vendor": "Other"},
+                {
+                    "id": "gpt-6-astra",
+                    "vendor": "野菜API",
+                    "url": "https://yeschoy.com/v1/chat/completions",
+                    "apiKey": "synthetic-workbuddy-key"
+                }
+            ],
+            "availableModels": ["other", "gpt-6-astra", "wb-extra"]
+        }))
+        .unwrap();
+        let cleaned = legacy_clean(
+            "workbuddy",
+            &f.path(".workbuddy/models.json"),
+            Some(&bytes),
+            &credential,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let value: Value = serde_json::from_slice(&cleaned).unwrap();
+        assert_eq!(value["models"], json!([{"id": "other", "vendor": "Other"}]));
+        assert_eq!(value["availableModels"], json!(["other", "wb-extra"]));
+    }
+
+    #[test]
+    fn restores_exact_original_bytes_for_all_six_tools() {
+        for tool in [
+            "claude_code",
+            "claude_desktop",
+            "codex_desktop",
+            "pi",
+            "dsh_web",
+            "workbuddy",
+        ] {
+            let f = Fixture::new();
+            let before = b"{\n  \"old\": true\n}\n";
+            let file = f.change(
+                "config.json",
+                Some(before),
+                br#"{"old":true,"model":"new"}"#,
+            );
+            let mut record =
+                f.0.begin(receipt(tool), std::slice::from_ref(&file), None)
+                    .unwrap();
+            common::atomic_write(&file.path, &file.after).unwrap();
+            f.0.finish(&mut record).unwrap();
+            assert!(configuration_matches(&record));
+            assert!(!restore_files(&record).unwrap());
+            assert_eq!(std::fs::read(&file.path).unwrap(), before);
+            assert!(!restore_files(&record).unwrap()); // retry is harmless
+        }
+    }
+    #[test]
+    fn desktop_failed_switch_recovers_previous_connection_not_factory_settings() {
+        for tool in ["codex_desktop", "claude_desktop"] {
+            let f = Fixture::new();
+            let first = f.change(
+                "desktop.json",
+                Some(br#"{"model":"factory"}"#),
+                br#"{"model":"a"}"#,
+            );
+            let mut ready =
+                f.0.begin(receipt(tool), std::slice::from_ref(&first), None)
+                    .unwrap();
+            common::atomic_write(&first.path, &first.after).unwrap();
+            f.0.finish(&mut ready).unwrap();
+            let second = f.change("desktop.json", Some(&first.after), br#"{"model":"b"}"#);
+            f.0.begin(receipt(tool), std::slice::from_ref(&second), None)
+                .unwrap();
+            common::atomic_write(&second.path, &second.after).unwrap();
+            assert_eq!(f.0.recover_pending(tool, || true), Ok(true));
+            assert_eq!(common::snapshot(&second.path).unwrap(), Some(first.after));
+            assert!(!f.0.load(tool).unwrap().unwrap().pending);
+            assert_eq!(
+                f.0.recover_pending(tool, || panic!("must not replay completed recovery")),
+                Ok(false)
+            );
+        }
+    }
+    #[test]
+    fn desktop_checkpoint_keeps_credentials_encrypted_until_recovery_finishes() {
+        let f = Fixture::new();
+        let previous = credential();
+        let file = f.change(
+            "desktop.json",
+            Some(br#"{"model":"a"}"#),
+            br#"{"model":"b"}"#,
+        );
+        let mut pending =
+            f.0.begin(
+                receipt("codex_desktop"),
+                std::slice::from_ref(&file),
+                Some(&previous),
+            )
+            .unwrap();
+        let bytes = std::fs::read(f.0.path("codex_desktop").unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(&previous.api_key));
+        assert_eq!(
+            f.0.load("codex_desktop")
+                .unwrap()
+                .unwrap()
+                .rollback_credential(),
+            Some(&previous)
+        );
+        common::atomic_write(&file.path, &file.after).unwrap();
+        assert_eq!(
+            f.0.recover_pending("codex_desktop", || false),
+            Err(PendingRecoveryFailure::Credential)
+        );
+        assert!(f.0.load("codex_desktop").unwrap().unwrap().pending);
+        assert_eq!(common::snapshot(&file.path).unwrap(), file.before);
+        assert_eq!(f.0.recover_pending("codex_desktop", || true), Ok(true));
+        assert!(f.0.load("codex_desktop").unwrap().is_none());
+
+        f.0.finish(&mut pending).unwrap();
+        assert!(f
+            .0
+            .load("codex_desktop")
+            .unwrap()
+            .unwrap()
+            .rollback_checkpoint
+            .is_none());
+    }
+
+    #[test]
+    fn desktop_rollback_preserves_unrelated_edits_but_stops_on_owned_conflicts() {
+        let f = Fixture::new();
+        let file = f.change(
+            "desktop.json",
+            Some(br#"{"model":"a","theme":"dark"}"#),
+            br#"{"model":"b","theme":"dark"}"#,
+        );
+        f.0.begin(receipt("claude_desktop"), std::slice::from_ref(&file), None)
+            .unwrap();
+        common::atomic_write(&file.path, br#"{"model":"user-choice","theme":"light"}"#).unwrap();
+        assert_eq!(
+            f.0.recover_pending("claude_desktop", || panic!(
+                "must not replace credential before files recover"
+            )),
+            Err(PendingRecoveryFailure::Files)
+        );
+        assert!(f.0.load("claude_desktop").unwrap().unwrap().pending);
+        common::atomic_write(&file.path, br#"{"model":"b","theme":"light"}"#).unwrap();
+        assert_eq!(f.0.recover_pending("claude_desktop", || true), Ok(true));
+        assert_eq!(
+            document(&file.path, common::snapshot(&file.path).unwrap().as_deref()).unwrap(),
+            json!({"model":"a","theme":"light"})
+        );
+    }
+
+    #[test]
+    fn old_desktop_pending_journals_remain_readable_without_a_checkpoint() {
+        let f = Fixture::new();
+        let file = f.change(
+            "desktop.json",
+            Some(br#"{"model":"factory"}"#),
+            br#"{"model":"b"}"#,
+        );
+        let mut legacy =
+            f.0.begin(receipt("claude_desktop"), std::slice::from_ref(&file), None)
+                .unwrap();
+        legacy.rollback_checkpoint = None;
+        f.0.save(&legacy).unwrap();
+        common::atomic_write(&file.path, &file.after).unwrap();
+        assert!(f
+            .0
+            .load("claude_desktop")
+            .unwrap()
+            .unwrap()
+            .rollback_credential()
+            .is_none());
+        assert_eq!(f.0.recover_pending("claude_desktop", || true), Ok(true));
+        assert_eq!(common::snapshot(&file.path).unwrap(), file.before);
+    }
+
+    #[test]
+    fn desktop_partial_commit_recovers_previous_model_and_retains_original_baseline() {
+        for tool in ["codex_desktop", "claude_desktop"] {
+            for written_count in 0..=2 {
+                let f = Fixture::new();
+                let first = [
+                    f.change(
+                        "a.json",
+                        Some(br#"{"model":"factory"}"#),
+                        br#"{"model":"a"}"#,
+                    ),
+                    f.change("b.json", Some(b"{}"), br#"{"model":"a"}"#),
+                ];
+                let mut original = f.0.begin(receipt(tool), &first, None).unwrap();
+                for file in &first {
+                    common::atomic_write(&file.path, &file.after).unwrap();
+                }
+                f.0.finish(&mut original).unwrap();
+                let next = [
+                    f.change("a.json", Some(&first[0].after), br#"{"model":"b"}"#),
+                    f.change("b.json", Some(&first[1].after), br#"{"model":"b"}"#),
+                ];
+                f.0.begin(receipt(tool), &next, Some(&credential()))
+                    .unwrap();
+                for file in next.iter().take(written_count) {
+                    common::atomic_write(&file.path, &file.after).unwrap();
+                }
+                assert_eq!(f.0.recover_pending(tool, || true), Ok(true));
+                for file in &first {
+                    assert_eq!(
+                        common::snapshot(&file.path).unwrap(),
+                        Some(file.after.clone())
+                    );
+                }
+                let previous = f.0.load(tool).unwrap().unwrap();
+                assert!(!previous.pending);
+                restore_files(&previous).unwrap();
+                for file in &first {
+                    assert_eq!(common::snapshot(&file.path).unwrap(), file.before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_rollback_does_not_block_on_unrelated_claude_profile_entries() {
+        let f = Fixture::new();
+        let file = f.change(
+            "meta.json",
+            Some(br#"{"entries":[{"id":"ours","model":"a"}]}"#),
+            br#"{"entries":[{"id":"ours","model":"b"}]}"#,
+        );
+        let pending =
+            f.0.begin(receipt("claude_desktop"), std::slice::from_ref(&file), None)
+                .unwrap();
+        common::atomic_write(
+            &file.path,
+            br#"{"entries":[{"id":"foreign"},{"id":"ours","model":"b"}]}"#,
+        )
+        .unwrap();
+        assert!(restore_attempt(&pending).is_ok());
+        assert_eq!(
+            document(&file.path, common::snapshot(&file.path).unwrap().as_deref()).unwrap(),
+            json!({"entries":[{"id":"foreign"},{"id":"ours","model":"a"}]})
+        );
+        common::atomic_write(
+            &file.path,
+            br#"{"entries":[{"id":"foreign"},{"id":"ours","model":"user-choice"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(restore_attempt(&pending), Err(Failure::Changed));
+    }
+    #[test]
+    fn switch_keeps_first_baseline_and_rebases_later_unrelated_changes() {
+        let f = Fixture::new();
+        let first = f.change(
+            "settings.json",
+            Some(br#"{"model":"old","theme":"dark"}"#),
+            br#"{"model":"a","theme":"dark"}"#,
+        );
+        let mut record = f.0.begin(receipt("pi"), &[first], None).unwrap();
+        f.0.finish(&mut record).unwrap();
+        let second = f.change(
+            "settings.json",
+            Some(br#"{"model":"a","theme":"light"}"#),
+            br#"{"model":"b","theme":"light"}"#,
+        );
+        let mut record =
+            f.0.begin(receipt("pi"), std::slice::from_ref(&second), None)
+                .unwrap();
+        common::atomic_write(&second.path, &second.after).unwrap();
+        f.0.finish(&mut record).unwrap();
+        restore_files(&record).unwrap();
+        assert_eq!(
+            document(
+                &second.path,
+                common::snapshot(&second.path).unwrap().as_deref()
+            )
+            .unwrap(),
+            json!({"model":"old","theme":"light"})
+        );
+    }
+    #[test]
+    fn preserves_owned_conflicts_unrelated_changes_and_profile_order() {
+        let f = Fixture::new();
+        let file = f.change(
+            "settings.json",
+            Some(br#"{"model":"old","theme":"dark"}"#),
+            br#"{"model":"new","theme":"dark"}"#,
+        );
+        let (value, kept) = merged(
+            &file,
+            json!({"model":"new","theme":"light","userAdded":true}),
+        );
+        assert!(kept);
+        assert_eq!(
+            value,
+            json!({"model":"old","theme":"light","userAdded":true})
+        );
+        let (value, kept) = merged(&file, json!({"model":"user-choice","theme":"dark"}));
+        assert!(kept);
+        assert_eq!(value["model"], "user-choice");
+        let file = f.change(
+            "meta.json",
+            Some(br#"{"entries":[{"id":"a"},{"id":"b"}]}"#),
+            br#"{"entries":[{"id":"a"},{"id":"b"},{"id":"yeschoy"}]}"#,
+        );
+        let (value, kept) = merged(
+            &file,
+            json!({"entries":[{"id":"a"},{"id":"b"},{"id":"yeschoy"},{"id":"c"}]}),
+        );
+        assert!(kept);
+        assert_eq!(value, json!({"entries":[{"id":"a"},{"id":"b"},{"id":"c"}]}));
+    }
+    #[test]
+    fn newly_created_file_removed_only_when_no_user_content_remains() {
+        let f = Fixture::new();
+        let file = f.change("settings.json", None, br#"{"model":"new"}"#);
+        assert_eq!(
+            restore_bytes(&file, Some(&file.after)).unwrap(),
+            (None, false)
+        );
+        let (value, kept) = merged(&file, json!({"model":"new","user":true}));
+        assert!(kept);
+        assert_eq!(value, json!({"user":true}));
+        assert_eq!(restore_bytes(&file, None).unwrap().0, None);
+    }
+    #[test]
+    fn handles_toml_comments_and_yaml_and_rejects_invalid_document_before_any_write() {
+        let f = Fixture::new();
+        let file = f.change("config.toml", Some(b"model = 'old'\n"), b"model = 'new'\n");
+        let (bytes, kept) =
+            restore_bytes(&file, Some(b"# my comment\nmodel = 'new'\nuser = true\n")).unwrap();
+        let text = String::from_utf8(bytes.unwrap()).unwrap();
+        assert!(kept);
+        assert!(text.contains("# my comment"));
+        assert!(text.contains("user = true"));
+        let yaml = f.change("config.yaml", Some(b"model: old\n"), b"model: new\n");
+        let (bytes, kept) = restore_bytes(&yaml, Some(b"model: new\nuser: true\n")).unwrap();
+        assert!(kept);
+        assert_eq!(
+            document(&yaml.path, bytes.as_deref()).unwrap(),
+            json!({"model":"old","user":true})
+        );
+        let bad = f.change("bad.json", Some(b"{}"), br#"{"model":"new"}"#);
+        let record =
+            f.0.begin(receipt("pi"), &[file.clone(), bad.clone()], None)
+                .unwrap();
+        common::atomic_write(&file.path, &file.after).unwrap();
+        common::atomic_write(&bad.path, b"invalid {").unwrap();
+        assert_eq!(restore_files(&record), Err(Failure::Invalid));
+        assert_eq!(std::fs::read(&file.path).unwrap(), file.after);
+    }
+    #[test]
+    fn pending_switch_recovers_files_written_before_or_after_crash() {
+        let f = Fixture::new();
+        let first = [
+            f.change("a.json", Some(br#"{"model":"old"}"#), br#"{"model":"a"}"#),
+            f.change("b.json", Some(b"{}"), br#"{"model":"a"}"#),
+        ];
+        let mut original = f.0.begin(receipt("pi"), &first, None).unwrap();
+        f.0.finish(&mut original).unwrap();
+        let next = [
+            f.change("a.json", Some(&first[0].after), br#"{"model":"b"}"#),
+            f.change("b.json", Some(&first[1].after), br#"{"model":"b"}"#),
+        ];
+        let pending = f.0.begin(receipt("pi"), &next, None).unwrap();
+        common::atomic_write(&next[0].path, &next[0].after).unwrap();
+        common::atomic_write(&next[1].path, &first[1].after).unwrap();
+        assert!(f.0.begin(receipt("pi"), &next, None).is_err());
+        restore_files(&pending).unwrap();
+        restore_files(&pending).unwrap();
+        for file in first {
+            assert_eq!(common::snapshot(&file.path).unwrap(), file.before);
+        }
+    }
+    #[test]
+    fn ru054_pending_retry_recovers_once_and_preserves_completed_records() {
+        use std::cell::Cell;
+
+        let f = Fixture::new();
+        let file = f.change(
+            "retry.json",
+            Some(br#"{"model":"old","theme":"dark"}"#),
+            br#"{"model":"new","theme":"dark"}"#,
+        );
+        let pending =
+            f.0.begin(receipt("pi"), std::slice::from_ref(&file), None)
+                .unwrap();
+        common::atomic_write(
+            &file.path,
+            br#"{"model":"new","theme":"light","later":true}"#,
+        )
+        .unwrap();
+        assert!(pending.pending);
+        let clears = Cell::new(0);
+        assert_eq!(
+            f.0.recover_pending("pi", || {
+                clears.set(clears.get() + 1);
+                true
+            }),
+            Ok(true)
+        );
+        assert_eq!(clears.get(), 1);
+        assert!(f.0.load("pi").unwrap().is_none());
+        assert_eq!(
+            document(&file.path, common::snapshot(&file.path).unwrap().as_deref()).unwrap(),
+            json!({"model":"old","theme":"light","later":true})
+        );
+        assert_eq!(f.0.recover_pending("pi", || false), Ok(false));
+
+        let completed_file = f.change(
+            "completed.json",
+            Some(br#"{"model":"old"}"#),
+            br#"{"model":"ready"}"#,
+        );
+        let mut completed =
+            f.0.begin(
+                receipt("claude_code"),
+                std::slice::from_ref(&completed_file),
+                None,
+            )
+            .unwrap();
+        common::atomic_write(&completed_file.path, &completed_file.after).unwrap();
+        f.0.finish(&mut completed).unwrap();
+        assert_eq!(
+            f.0.recover_pending("claude_code", || panic!("completed credential cleared")),
+            Ok(false)
+        );
+        assert_eq!(
+            common::snapshot(&completed_file.path).unwrap(),
+            Some(completed_file.after)
+        );
+        assert!(!f.0.load("claude_code").unwrap().unwrap().pending);
+
+        let failed_file = f.change(
+            "credential.json",
+            Some(br#"{"model":"before"}"#),
+            br#"{"model":"during"}"#,
+        );
+        f.0.begin(receipt("pi"), std::slice::from_ref(&failed_file), None)
+            .unwrap();
+        common::atomic_write(&failed_file.path, &failed_file.after).unwrap();
+        assert_eq!(
+            f.0.recover_pending("pi", || false),
+            Err(PendingRecoveryFailure::Credential)
+        );
+        assert!(f.0.load("pi").unwrap().unwrap().pending);
+    }
+    #[test]
+    fn legacy_cleanup_never_removes_other_claude_mode_or_later_model_endpoint() {
+        let f = Fixture::new();
+        let credential = credential();
+        let bytes = br#"{"deploymentMode":"3p","other":true}"#;
+        assert_eq!(
+            legacy_clean(
+                "claude_desktop",
+                &f.path("config.json"),
+                Some(bytes),
+                &credential,
+                false
+            )
+            .unwrap(),
+            Some(bytes.to_vec())
+        );
+        let bytes=br#"{"apiKeyHelper":"'/test/yeschoy' credential-helper claude_code","env":{"ANTHROPIC_BASE_URL":"https://custom.invalid","ANTHROPIC_MODEL":"user-model","ANTHROPIC_DEFAULT_HAIKU_MODEL":"model-new"}}"#;
+        let value = document(
+            &f.path("settings.json"),
+            legacy_clean(
+                "claude_code",
+                &f.path("settings.json"),
+                Some(bytes),
+                &credential,
+                false,
+            )
+            .unwrap()
+            .as_deref(),
+        )
+        .unwrap();
+        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://custom.invalid");
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "user-model");
+        assert!(value.get("apiKeyHelper").is_none());
+        assert!(value["env"].get("ANTHROPIC_DEFAULT_HAIKU_MODEL").is_none());
+    }
+    #[test]
+    fn process_lock_is_exclusive_and_released_on_drop() {
+        let f = Fixture::new();
+        let first = operation_lock_at(&f.0.root).unwrap();
+        assert!(operation_lock_at(&f.0.root).is_err());
+        drop(first);
+        assert!(operation_lock_at(&f.0.root).is_ok());
+    }
+    #[test]
+    fn read_only_snapshot_never_creates_parent_and_rejects_symlink_ancestors() {
+        let f = Fixture::new();
+        let path = f.path("absent/child/config.json");
+        assert_eq!(common::snapshot(&path).unwrap(), None);
+        assert!(!path.parent().unwrap().exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&f.0.root, f.path("alias")).unwrap();
+            assert!(common::snapshot(&f.path("alias/absent/config.json")).is_err());
+        }
+    }
+
+    fn unix_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    const OLD_CLIENT: &str = "/Applications/开饭.app/Contents/MacOS/kaifan-desktop";
+    const NEW_CLIENT: &str = "/Applications/YesChoy.app/Contents/MacOS/yeschoy-desktop";
+
+    fn connected(f: &Fixture, tool: &str, name: &str, after: &[u8]) -> FileChange {
+        let file = f.change(name, None, after);
+        let mut record =
+            f.0.begin(receipt(tool), std::slice::from_ref(&file), None)
+                .unwrap();
+        common::atomic_write(&file.path, after).unwrap();
+        f.0.finish(&mut record).unwrap();
+        file
+    }
+
+    fn follow(f: &Fixture, tool: &str) -> Result<bool> {
+        follow_helper(&f.0, tool, Path::new(NEW_CLIENT), unix_quote)
+    }
+
+    #[test]
+    fn a_connected_app_follows_the_renamed_client_and_stays_connected() {
+        let f = Fixture::new();
+        let settings = format!(
+            "{{\n  \"apiKeyHelper\": \"'{OLD_CLIENT}' gateway-credential-helper claude_code\",\n  \"theme\": \"dark\"\n}}"
+        );
+        let file = connected(&f, "claude_code", "settings.json", settings.as_bytes());
+        assert_eq!(follow(&f, "claude_code"), Ok(true));
+        let live = String::from_utf8(common::snapshot(&file.path).unwrap().unwrap()).unwrap();
+        // 只有那条路径变了，别的一个字节都没动。
+        assert_eq!(live, settings.replace(OLD_CLIENT, NEW_CLIENT));
+        let record = f.0.load("claude_code").unwrap().unwrap();
+        assert!(configuration_matches(&record));
+        assert!(!record.pending);
+        assert_eq!(record.receipt.model_id, "model-new");
+        // 再跑一次：已经是现在的位置，什么都不做。
+        assert_eq!(follow(&f, "claude_code"), Ok(false));
+    }
+
+    #[test]
+    fn pi_and_codex_helper_paths_follow_too() {
+        let f = Fixture::new();
+        let models = format!(
+            "{{\"providers\":{{\"yeschoy\":{{\"apiKey\":\"!'{OLD_CLIENT}' credential-helper pi\"}},\"mine\":{{\"apiKey\":\"!op read op://x\"}}}}}}"
+        );
+        let pi = connected(&f, "pi", "models.json", models.as_bytes());
+        assert_eq!(follow(&f, "pi"), Ok(true));
+        assert_eq!(
+            common::snapshot(&pi.path).unwrap().unwrap(),
+            models.replace(OLD_CLIENT, NEW_CLIENT).into_bytes()
+        );
+
+        let config = format!(
+            "# mine\nmodel_provider = \"yeschoy\"\n\n[model_providers.other.auth]\ncommand = \"/usr/bin/op\"\nargs = [\"read\"]\n\n[model_providers.yeschoy.auth]\ncommand = \"{OLD_CLIENT}\"\nargs = [\"credential-helper\", \"codex_desktop\"]\n"
+        );
+        let codex = connected(&f, "codex_desktop", "config.toml", config.as_bytes());
+        assert_eq!(follow(&f, "codex_desktop"), Ok(true));
+        assert_eq!(
+            common::snapshot(&codex.path).unwrap().unwrap(),
+            config.replace(OLD_CLIENT, NEW_CLIENT).into_bytes()
+        );
+        assert!(configuration_matches(
+            &f.0.load("codex_desktop").unwrap().unwrap()
+        ));
+    }
+
+    #[test]
+    fn settings_someone_else_changed_are_left_exactly_as_they_are() {
+        let f = Fixture::new();
+        let settings =
+            format!("{{\"apiKeyHelper\":\"'{OLD_CLIENT}' credential-helper claude_code\"}}");
+        let file = connected(&f, "claude_code", "settings.json", settings.as_bytes());
+        let edited = format!(
+            "{{\"apiKeyHelper\":\"'{OLD_CLIENT}' credential-helper claude_code\",\"x\":1}}"
+        );
+        common::atomic_write(&file.path, edited.as_bytes()).unwrap();
+        assert_eq!(follow(&f, "claude_code"), Ok(false));
+        assert_eq!(
+            common::snapshot(&file.path).unwrap().unwrap(),
+            edited.into_bytes()
+        );
+        // 没接过的应用、上次没接完的应用：也不碰。
+        assert_eq!(follow(&f, "pi"), Ok(false));
+        let half = f.change("half.json", None, settings.as_bytes());
+        f.0.begin(receipt("pi"), std::slice::from_ref(&half), None)
+            .unwrap();
+        common::atomic_write(&half.path, settings.as_bytes()).unwrap();
+        assert_eq!(follow(&f, "pi"), Ok(false));
+    }
+
+    #[test]
+    fn an_interrupted_move_is_finished_on_the_next_start() {
+        let f = Fixture::new();
+        let settings =
+            format!("{{\"apiKeyHelper\":\"'{OLD_CLIENT}' credential-helper claude_code\"}}");
+        let file = connected(&f, "claude_code", "settings.json", settings.as_bytes());
+        // 上次只来得及改了应用里的文件，记录还没更新就断了。
+        let moved = settings.replace(OLD_CLIENT, NEW_CLIENT);
+        common::atomic_write(&file.path, moved.as_bytes()).unwrap();
+        assert!(!configuration_matches(
+            &f.0.load("claude_code").unwrap().unwrap()
+        ));
+        assert_eq!(follow(&f, "claude_code"), Ok(true));
+        assert!(configuration_matches(
+            &f.0.load("claude_code").unwrap().unwrap()
+        ));
+        assert_eq!(
+            common::snapshot(&file.path).unwrap().unwrap(),
+            moved.into_bytes()
+        );
+    }
+}

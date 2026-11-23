@@ -1,0 +1,802 @@
+pub(crate) mod claude_code;
+pub(crate) mod claude_desktop;
+pub(crate) mod cline;
+pub(crate) mod codex_desktop;
+pub(crate) mod common;
+pub(crate) mod cursorpp;
+pub(crate) mod desktop_launch;
+pub(crate) mod desktop_lifecycle;
+pub(crate) mod dsh_web;
+pub(crate) mod hermes;
+pub(crate) mod openclaw;
+pub(crate) mod opencode;
+pub(crate) mod pi;
+pub(crate) mod terminal_launch;
+pub(crate) mod workbuddy;
+
+use std::path::{Path, PathBuf};
+
+use futures::{stream, StreamExt};
+use serde::Serialize;
+
+use crate::{desktop_app_discovery, tool_discovery};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdapterFailure {
+    ToolNotFound,
+    MultipleInstallations,
+    MissingRuntime,
+    UnsupportedProfile,
+    ExternalOverride,
+    SecureStorageUnavailable,
+    ConfigurationFailed(&'static str),
+    LaunchFailed,
+    LaunchError(&'static str),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedInstallation {
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InstallationProjection {
+    pub(crate) installation_id: String,
+    pub(crate) label: String,
+    pub(crate) version: String,
+    pub(crate) supported: bool,
+    pub(crate) recommended: bool,
+    /// 这一份打开的是终端窗口而不是应用窗口。只有同一个应用两种都有时才用得着
+    /// 分（Codex 的桌面版和命令行版共用一条接入），所以只在是的时候带上。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) terminal: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TargetProjection {
+    pub(crate) tool_id: &'static str,
+    pub(crate) display_name: &'static str,
+    pub(crate) surface: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) installations: Vec<InstallationProjection>,
+    /// `none`, `in_use`, or `unavailable` when the location the user picked no
+    /// longer checks out (uninstalled, moved, a drive that is not plugged in)
+    /// and the automatic scan is being used instead.
+    pub(crate) manual_location: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct ObservedInstallation {
+    path: PathBuf,
+    version: String,
+    location: &'static str,
+}
+
+const TARGETS: [(&str, &str, &str); 12] = [
+    ("claude_code", "Claude Code", "命令行与编辑器工作区"),
+    ("claude_desktop", "Claude Desktop", "Claude 桌面应用"),
+    (
+        "codex_desktop",
+        "Codex",
+        "Codex desktop or CLI (one shared settings file)",
+    ),
+    ("pi", "Pi", "Pi 编程助手"),
+    ("opencode", "OpenCode", "OpenCode 终端编程助手"),
+    ("dsh_web", "DSH web", "DeepSeek Harness 浏览器工作台"),
+    ("workbuddy", "WorkBuddy", "腾讯 AI 办公与开发助手"),
+    (
+        "dsh_desktop",
+        "DeepSeek Harness",
+        "DeepSeek Harness 桌面应用",
+    ),
+    ("cline", "Cline", "Cline 命令行与编辑器扩展"),
+    ("hermes", "Hermes Agent", "Hermes Agent 命令行"),
+    ("openclaw", "OpenClaw", "OpenClaw 命令行"),
+    ("cursorpp", "Cursor++", "已经装好的 Cursor++"),
+];
+
+pub(crate) fn user_home() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let drive = std::env::var_os("HOMEDRIVE")?;
+                let path = std::env::var_os("HOMEPATH")?;
+                let mut home = PathBuf::from(drive);
+                home.push(path);
+                Some(home)
+            })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+pub(crate) fn executable_for(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "claude_code" => Some("claude"),
+        "pi" => Some("pi"),
+        "opencode" => Some("opencode"),
+        "cline" => Some("cline"),
+        "hermes" => Some("hermes"),
+        "openclaw" => Some("openclaw"),
+        "dsh_web" => Some("dsh"),
+        _ => None,
+    }
+}
+
+pub(crate) fn desktop_id_for(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "claude_desktop" => Some("claude_desktop"),
+        "codex_desktop" => Some("codex_desktop"),
+        "workbuddy" => Some("workbuddy"),
+        "dsh_desktop" => Some("dsh_desktop"),
+        _ => None,
+    }
+}
+
+/// The activation tool a CLI executable belongs to; the inverse of
+/// `executable_for`.
+pub(crate) fn cli_tool_for(executable: &str) -> Option<&'static str> {
+    TARGETS
+        .iter()
+        .map(|(tool_id, _, _)| *tool_id)
+        .find(|tool_id| executable_for(tool_id) == Some(executable))
+}
+
+pub(crate) fn display_name_for(tool_id: &str) -> Option<&'static str> {
+    TARGETS
+        .iter()
+        .find(|(id, _, _)| *id == tool_id)
+        .map(|(_, display_name, _)| *display_name)
+}
+
+/// Whether picking an installation is a question worth asking the user.
+///
+/// It never changes what gets configured: every adapter's `prepare_catalog`
+/// takes `home`, so the files written are user-level and identical whichever
+/// copy is selected. The choice only decides which binary or bundle the
+/// assistant launches and lifecycle-checks.
+///
+/// That makes it the wrong question for a CLI. What `claude` runs in a terminal
+/// is decided by the login shell's `PATH`, and `discover_candidates` already
+/// orders candidates by that. Asking the user would let them pick a second copy
+/// the "打开终端使用" button then launches while their own terminal keeps
+/// running the first one — two different binaries, no way to tell from the two
+/// identical labels they were offered.
+///
+/// Desktop bundles have no `PATH` to arbitrate, and discovery reads a real
+/// version out of them, so there the question is both necessary and answerable.
+fn asks_which_installation(tool_id: &str) -> bool {
+    desktop_id_for(tool_id).is_some()
+}
+
+/// A path the user can recognise, with the parts they should not have to see
+/// stripped out.
+///
+/// The home prefix collapses to `~`, which removes the account name — the only
+/// genuinely sensitive part of a local path — while still telling a person
+/// apart `~/Applications/Claude.app` from `/Applications/Claude.app`. A long
+/// path keeps its last two components, because the tail is what differs.
+/// Control and bidi characters are dropped: the renderer rejects them, and a
+/// user with an oddly named folder should not silently lose the entry.
+fn display_path(path: &Path, home: Option<&Path>) -> String {
+    let shortened = home
+        .and_then(|home| path.strip_prefix(home).ok())
+        .map(|rest| format!("~/{}", rest.to_string_lossy()))
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let chosen = if shortened.chars().count() <= 64 {
+        shortened
+    } else {
+        let tail = path
+            .components()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("…/{tail}")
+    };
+    // Filtering last, so a hostile name reached through the eliding branch is
+    // cleaned too, and truncation cannot leave a half-written escape sequence.
+    chosen
+        .chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(64)
+        .collect()
+}
+
+fn opaque_installation_id(path: &Path) -> String {
+    // FNV-1a is used only as an opaque, local selection handle.
+    //
+    // What this protects is the *inbound* direction: the renderer hands back an
+    // id, never a path, so it cannot steer the backend at an arbitrary file,
+    // and collisions are rejected during resolution. Putting a readable path in
+    // the outbound `label` does not weaken that — it is a caption for a choice
+    // the user is already making about their own machine.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("i{hash:016x}")
+}
+
+fn can_attempt(tool_id: &str, installation: &ObservedInstallation) -> bool {
+    // Discovery already establishes product identity. A version is metadata,
+    // not evidence that a configuration contract has changed. The transaction
+    // parses/readbacks owned fields and the tool request proves usability.
+    match tool_id {
+        "codex_desktop" | "claude_desktop" | "workbuddy" | "dsh_desktop" => {
+            installation.path.exists()
+        }
+        "claude_code" | "pi" | "opencode" | "dsh_web" | "hermes" | "openclaw" => {
+            installation.path.is_file()
+        }
+        // 只有命令行版能一键接。编辑器扩展（文件夹，见
+        // `cline::extension_directories`）另有一份“当前厂商”，不看我们写的设置。
+        "cline" => installation.path.is_file(),
+        // 只接用户自己装好的 Cursor++：它的配置目录在，才算装了。
+        "cursorpp" => installation.path.is_dir(),
+        _ => false,
+    }
+}
+
+async fn observe_cli(executable: &str) -> Vec<ObservedInstallation> {
+    // Activation eligibility is based on the closed path inventory and atomic
+    // configuration readback, never on `--version` output. Starting five
+    // third-party CLIs here could add up to minutes of cold-start time before
+    // the beginner could even choose an app, so this scan remains read-only
+    // and process-free. Exact version diagnostics remain available through the
+    // dedicated tool discovery command.
+    //
+    // A location the user picked by hand wins outright: they chose it because
+    // the scan found nothing, or found the wrong copy.
+    if let Some(path) = crate::manual_locations::cli_location(executable) {
+        return vec![ObservedInstallation {
+            path,
+            version: String::new(),
+            location: "manual",
+        }];
+    }
+    tool_discovery::discover_candidates(executable)
+        .into_iter()
+        .take(MAX_INSTALLATIONS)
+        .map(|candidate| ObservedInstallation {
+            path: candidate.path,
+            version: String::new(),
+            location: candidate.location_hint.as_str(),
+        })
+        .collect()
+}
+
+/// 一个应用最多报这么多份安装。界面那边超过这个数就整份扫描结果都不认，
+/// 所有应用都接不了，所以两边必须是同一个数（`activation.ts` 的 `decodeTarget`）。
+const MAX_INSTALLATIONS: usize = 8;
+
+/// 把编辑器里的 Cline 扩展接在命令行版后面，合起来不超过上限。命令行版在前：
+/// 能一键接入的是它，位置不够时先留它。
+fn append_extensions(observed: &mut Vec<ObservedInstallation>, extensions: Vec<PathBuf>) {
+    observed.extend(extensions.into_iter().map(|path| ObservedInstallation {
+        path,
+        version: String::new(),
+        location: "extension",
+    }));
+    observed.truncate(MAX_INSTALLATIONS);
+}
+
+async fn observe(tool_id: &str) -> Vec<ObservedInstallation> {
+    if tool_id == "cursorpp" {
+        return user_home()
+            .map(|home| cursorpp::config_dir(&home))
+            .filter(|dir| dir.is_dir())
+            .map(|path| ObservedInstallation {
+                path,
+                version: String::new(),
+                location: "user_config",
+            })
+            .into_iter()
+            .collect();
+    }
+    if let Some(executable) = executable_for(tool_id) {
+        let mut observed = observe_cli(executable).await;
+        // Cline 多数人装的是编辑器扩展，不是命令行。扩展也报上去，但只为了
+        // 照实说“装在编辑器里，要手动填”，不拿它接入（见 `can_attempt`）。
+        // 手动指过位置的不再追加：那是用户说了算。
+        if tool_id == "cline" && !observed.iter().any(|item| item.location == "manual") {
+            if let Some(home) = user_home() {
+                append_extensions(&mut observed, cline::extension_directories(&home));
+            }
+        }
+        return observed;
+    }
+    let Some(app_id) = desktop_id_for(tool_id) else {
+        return Vec::new();
+    };
+    let mut observed: Vec<ObservedInstallation> =
+        desktop_app_discovery::activation_candidates(app_id)
+            .into_iter()
+            .map(|candidate| ObservedInstallation {
+                path: candidate.path,
+                version: candidate.version,
+                location: candidate.location_hint,
+            })
+            .collect();
+    // Codex 命令行版和桌面版读同一份 `~/.codex/config.toml`，所以两者共用
+    // `codex_desktop` 这一条接入：只装了 CLI 的人也能一键接入。
+    if tool_id == "codex_desktop" {
+        observed.extend(observe_cli(codex_desktop::CLI_EXECUTABLE).await);
+    }
+    observed
+}
+
+fn projections(tool_id: &str, observed: &[ObservedInstallation]) -> Vec<InstallationProjection> {
+    let preferred = observed
+        .iter()
+        .position(|installation| can_attempt(tool_id, installation));
+    let home = user_home();
+    observed
+        .iter()
+        .enumerate()
+        .map(|(index, installation)| InstallationProjection {
+            installation_id: opaque_installation_id(&installation.path),
+            // "安装 1 · 系统 PATH" told the user nothing: CLI discovery leaves
+            // `version` empty on purpose, so two entries could be completely
+            // indistinguishable. The location stays as context; the path is
+            // what actually answers the question.
+            label: format!(
+                "{} · {}",
+                location_label(installation.location),
+                display_path(&installation.path, home.as_deref())
+            ),
+            version: installation.version.clone(),
+            supported: can_attempt(tool_id, installation),
+            recommended: preferred == Some(index),
+            terminal: tool_id == "codex_desktop"
+                && codex_desktop::is_cli_installation(&installation.path),
+        })
+        .collect()
+}
+
+fn location_label(value: &str) -> &'static str {
+    location_label_in(crate::ui_language::current(), value)
+}
+
+// The renderer shows this label verbatim in the install picker, so it has to
+// speak the interface language: an English user was reading "系统应用 ·
+// /Applications/Claude.app". Kept separate from `location_label` so tests can
+// pin a language instead of racing on the process-wide setting.
+fn location_label_in(language: crate::ui_language::Language, value: &str) -> &'static str {
+    match value {
+        "path" => language.pick("系统 PATH", "System PATH"),
+        "common_location" => language.pick("常用目录", "Common directory"),
+        "applications" => language.pick("系统应用", "System app"),
+        "user_applications" => language.pick("用户应用", "User app"),
+        "local_app_data" => language.pick("用户应用目录", "User app data"),
+        "program_files" => language.pick("程序目录", "Program Files"),
+        "manual" => language.pick("手动指定", "Chosen by you"),
+        "extension" => language.pick("编辑器扩展", "Editor extension"),
+        _ => language.pick("本机", "This computer"),
+    }
+}
+
+pub(crate) async fn scan_targets() -> Vec<TargetProjection> {
+    stream::iter(0..TARGETS.len())
+        .map(scan_target)
+        .buffered(3)
+        .collect()
+        .await
+}
+
+/// Cline 只装在编辑器里：没有能一键接的命令行，界面改成给出要手填的地址。
+fn only_in_editor(tool_id: &str, observed: &[ObservedInstallation]) -> bool {
+    tool_id == "cline"
+        && !observed.is_empty()
+        && observed.iter().all(|item| item.location == "extension")
+}
+
+async fn scan_target(index: usize) -> TargetProjection {
+    let (tool_id, display_name, surface) = TARGETS[index];
+    let observed = observe(tool_id).await;
+    let supported_count = observed
+        .iter()
+        .filter(|item| can_attempt(tool_id, item))
+        .count();
+    // Only ask when there is a real choice, and only for the tools where the
+    // choice is real at all (see `asks_which_installation`). `observed` also
+    // carries entries that cannot be activated, so a single usable copy beside
+    // a stale one is an answer, not a question.
+    let status = if observed.is_empty() {
+        "not_found"
+    } else if only_in_editor(tool_id, &observed) {
+        "manual_only"
+    } else if supported_count == 0 {
+        "missing_runtime"
+    } else if supported_count > 1 && asks_which_installation(tool_id) {
+        "selection_required"
+    } else {
+        "available"
+    };
+    TargetProjection {
+        tool_id,
+        display_name,
+        surface,
+        status,
+        installations: projections(tool_id, &observed),
+        manual_location: if observed.iter().any(|item| item.location == "manual") {
+            "in_use"
+        } else if crate::manual_locations::is_stored(tool_id) {
+            "unavailable"
+        } else {
+            "none"
+        },
+    }
+}
+
+pub(crate) async fn resolve_installation(
+    tool_id: &str,
+    installation_id: &str,
+) -> Result<ResolvedInstallation, AdapterFailure> {
+    let observed = observe(tool_id).await;
+    if observed.is_empty() {
+        return Err(AdapterFailure::ToolNotFound);
+    }
+    let selected = if installation_id.is_empty() {
+        // Mirrors the `available` rule in `scan_target`, so the two can never
+        // disagree: whenever the scan did not ask, resolution must not refuse.
+        // `observed` is already ordered by login-shell PATH position, so the
+        // first usable candidate is the one the user's own terminal resolves.
+        let mut usable = observed
+            .iter()
+            .filter(|candidate| can_attempt(tool_id, candidate));
+        match (usable.next(), usable.next()) {
+            (Some(only), None) => only,
+            (None, _) => return Err(AdapterFailure::MissingRuntime),
+            (Some(first), Some(_)) if !asks_which_installation(tool_id) => first,
+            _ => return Err(AdapterFailure::MultipleInstallations),
+        }
+    } else {
+        let matches = observed
+            .iter()
+            .filter(|candidate| opaque_installation_id(&candidate.path) == installation_id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [only] => *only,
+            [] => return Err(AdapterFailure::ToolNotFound),
+            _ => return Err(AdapterFailure::MultipleInstallations),
+        }
+    };
+    if !can_attempt(tool_id, selected) {
+        return Err(AdapterFailure::MissingRuntime);
+    }
+    Ok(ResolvedInstallation {
+        path: selected.path.clone(),
+    })
+}
+
+/// User-level settings are shared by installations of the same product.
+/// Daily Open uses the same native preference order as discovery, never a
+/// renderer supplied path and never a version-number compatibility gate.
+pub(crate) async fn resolve_preferred_installation(
+    tool_id: &str,
+) -> Result<ResolvedInstallation, AdapterFailure> {
+    observe(tool_id)
+        .await
+        .into_iter()
+        .find(|candidate| can_attempt(tool_id, candidate))
+        .map(|candidate| ResolvedInstallation {
+            path: candidate.path,
+        })
+        .ok_or(AdapterFailure::ToolNotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 命令行版加上七个编辑器里的扩展能超过界面认的上限；超了整份扫描都作废。
+    #[test]
+    fn cline_extensions_never_push_a_target_past_the_installation_limit() {
+        let cli = |index: usize| ObservedInstallation {
+            path: PathBuf::from(format!("/bin/cline-{index}")),
+            version: String::new(),
+            location: "path",
+        };
+        let extensions = |count: usize| {
+            (0..count)
+                .map(|index| PathBuf::from(format!("/ext/{index}")))
+                .collect::<Vec<_>>()
+        };
+
+        let mut observed: Vec<_> = (0..2).map(cli).collect();
+        append_extensions(&mut observed, extensions(7));
+        assert_eq!(observed.len(), MAX_INSTALLATIONS);
+        assert_eq!(observed[0].location, "path");
+        assert_eq!(observed[1].location, "path");
+        assert!(observed[2..]
+            .iter()
+            .all(|item| item.location == "extension"));
+
+        let mut observed: Vec<_> = (0..MAX_INSTALLATIONS).map(cli).collect();
+        append_extensions(&mut observed, extensions(1));
+        assert_eq!(observed.len(), MAX_INSTALLATIONS);
+        assert!(observed.iter().all(|item| item.location == "path"));
+
+        let mut observed = vec![cli(0)];
+        append_extensions(&mut observed, extensions(2));
+        assert_eq!(observed.len(), 3);
+    }
+
+    #[test]
+    fn opaque_ids_are_stable_and_do_not_contain_paths() {
+        let path = Path::new("/Users/example/My Tools/claude");
+        let first = opaque_installation_id(path);
+        assert_eq!(first, opaque_installation_id(path));
+        assert!(!first.contains("Users"));
+        assert_eq!(first.len(), 17);
+    }
+
+    #[test]
+    fn ordinary_future_and_unread_versions_do_not_gate_eligibility() {
+        let directory = common::temporary_working_directory("version-metadata").unwrap();
+        let path = directory.join("tool");
+        std::fs::write(&path, b"fixture").unwrap();
+        for tool_id in ["claude_code", "pi", "dsh_web"] {
+            for version in ["0.84.4", "0.84.5", "2027.999.123.0", "", "future-beta"] {
+                let observed = ObservedInstallation {
+                    path: path.clone(),
+                    version: version.into(),
+                    location: "path",
+                };
+                assert!(can_attempt(tool_id, &observed));
+                assert!(projections(tool_id, &[observed])[0].supported);
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+        let disappeared = ObservedInstallation {
+            path,
+            version: "0.84.4".into(),
+            location: "path",
+        };
+        assert!(!can_attempt("pi", &disappeared));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn one_usable_copy_is_an_answer_even_when_discovery_found_others() {
+        // Discovery keeps unusable entries (a stale directory where the binary
+        // used to be, a bundle that no longer exists). With CLI versions left
+        // empty on purpose, offering those alongside the real installation gave
+        // the user two indistinguishable labels to choose between.
+        let directory = common::temporary_working_directory("single-usable").unwrap();
+        let real = directory.join("claude");
+        std::fs::write(&real, b"fixture").unwrap();
+        let observed = vec![
+            ObservedInstallation {
+                path: directory.join("gone"),
+                version: String::new(),
+                location: "common_location",
+            },
+            ObservedInstallation {
+                path: real.clone(),
+                version: String::new(),
+                location: "path",
+            },
+        ];
+        let supported = observed
+            .iter()
+            .filter(|item| can_attempt("claude_code", item))
+            .count();
+        assert_eq!(supported, 1);
+        let projected = projections("claude_code", &observed);
+        assert!(!projected[0].supported);
+        assert!(projected[1].supported);
+        assert!(projected[1].recommended);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_desktop_bundles_ask_which_installation() {
+        // The choice never changes what gets written — every adapter's
+        // prepare_catalog takes `home`. For a CLI it would only decide which
+        // binary the assistant launches, and the login shell already decides
+        // that; offering a second one invites the "打开使用" button to run a
+        // different copy than the user's own terminal does.
+        for cli in ["claude_code", "pi", "dsh_web"] {
+            assert!(!asks_which_installation(cli), "{cli}");
+        }
+        for desktop in [
+            "claude_desktop",
+            "codex_desktop",
+            "workbuddy",
+            "dsh_desktop",
+        ] {
+            assert!(asks_which_installation(desktop), "{desktop}");
+        }
+    }
+
+    #[test]
+    fn two_usable_bundles_still_require_a_choice() {
+        let directory = common::temporary_working_directory("two-usable").unwrap();
+        let first = directory.join("Claude.app");
+        let second = directory.join("Claude-2.app");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let observed = vec![
+            ObservedInstallation {
+                path: first,
+                version: "1.0".into(),
+                location: "applications",
+            },
+            ObservedInstallation {
+                path: second,
+                version: "0.9".into(),
+                location: "user_applications",
+            },
+        ];
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|item| can_attempt("claude_desktop", item))
+                .count(),
+            2
+        );
+        // Exactly one is recommended, so the picker has a default to land on.
+        let projected = projections("claude_desktop", &observed);
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|installation| installation.recommended)
+                .count(),
+            1
+        );
+        // And the two options are now told apart by something real.
+        assert_ne!(projected[0].label, projected[1].label);
+        assert!(projected[0].label.contains("Claude.app"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cline_in_an_editor_is_reported_but_only_the_command_line_can_be_connected() {
+        let directory = common::temporary_working_directory("cline-by-hand").unwrap();
+        let cli = directory.join("cline");
+        std::fs::write(&cli, b"#!/bin/sh\n").unwrap();
+        let extension = directory.join("saoudrizwan.claude-dev-4.1.27");
+        std::fs::create_dir(&extension).unwrap();
+        let in_editor = ObservedInstallation {
+            path: extension,
+            version: String::new(),
+            location: "extension",
+        };
+        let command_line = ObservedInstallation {
+            path: cli,
+            version: String::new(),
+            location: "path",
+        };
+        assert!(!can_attempt("cline", &in_editor));
+        assert!(can_attempt("cline", &command_line));
+
+        assert!(only_in_editor("cline", std::slice::from_ref(&in_editor)));
+        assert!(!only_in_editor("cline", &[]));
+        // 命令行也在：照常一键接，扩展不拿来接入。
+        let both = [command_line, in_editor];
+        assert!(!only_in_editor("cline", &both));
+        let projected = projections("cline", &both);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|item| (item.supported, item.recommended))
+                .collect::<Vec<_>>(),
+            [(true, true), (false, false)]
+        );
+        // 别的应用没有这种状态。
+        assert!(!only_in_editor("opencode", &both[1..]));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn labels_show_a_path_without_the_account_name() {
+        let home = Path::new("/Users/zxg");
+        assert_eq!(
+            display_path(Path::new("/Users/zxg/Applications/Claude.app"), Some(home)),
+            "~/Applications/Claude.app"
+        );
+        // Outside the home directory there is no account name to hide.
+        assert_eq!(
+            display_path(Path::new("/Applications/Claude.app"), Some(home)),
+            "/Applications/Claude.app"
+        );
+        // A long path keeps the tail, which is the part that differs.
+        let deep = Path::new(
+            "/Users/zxg/Library/Application Support/some/very/deeply/nested/vendor/tree/claude",
+        );
+        let shown = display_path(deep, Some(home));
+        assert!(shown.chars().count() <= 64, "{shown}");
+        assert!(shown.ends_with("tree/claude"), "{shown}");
+        // The renderer rejects control and bidi characters; dropping them here
+        // keeps one oddly named folder from discarding the whole entry.
+        let hostile = Path::new("/Applications/Cl\u{202e}aude.app");
+        assert_eq!(
+            display_path(hostile, Some(home)),
+            "/Applications/Claude.app"
+        );
+        // The frontend bounds `label` at 100 code points; the location prefix
+        // plus a 64-character path has to stay under that — in every language.
+        for language in [
+            crate::ui_language::Language::Zh,
+            crate::ui_language::Language::En,
+        ] {
+            for location in [
+                "path",
+                "common_location",
+                "applications",
+                "user_applications",
+                "local_app_data",
+                "program_files",
+                "unknown",
+            ] {
+                assert!(
+                    location_label_in(language, location).chars().count() + 3 + 64 <= 100,
+                    "label must fit the IPC contract: {language:?} {location}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn location_labels_follow_the_interface_language() {
+        // The picker shows this text verbatim, so it is the one place the
+        // native side must not answer in Chinese to an English interface.
+        use crate::ui_language::Language;
+        assert_eq!(location_label_in(Language::Zh, "applications"), "系统应用");
+        assert_eq!(
+            location_label_in(Language::En, "applications"),
+            "System app"
+        );
+        assert_eq!(location_label_in(Language::En, "path"), "System PATH");
+        assert_eq!(
+            location_label_in(Language::En, "user_applications"),
+            "User app"
+        );
+        assert_eq!(location_label_in(Language::En, "nonsense"), "This computer");
+        for location in [
+            "path",
+            "common_location",
+            "local_app_data",
+            "program_files",
+            "x",
+        ] {
+            assert!(
+                location_label_in(Language::En, location).is_ascii(),
+                "{location}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_codex_desktop_does_not_require_an_unused_bundled_cli() {
+        let directory = common::temporary_working_directory("codex-without-cli").unwrap();
+        let app = directory.join("Codex.app");
+        std::fs::create_dir(&app).unwrap();
+        let installation = ObservedInstallation {
+            path: app,
+            version: String::new(),
+            location: "applications",
+        };
+        assert!(can_attempt("codex_desktop", &installation));
+        assert!(projections("codex_desktop", &[installation])[0].supported);
+        assert!(!directory
+            .join("Codex.app/Contents/Resources/codex")
+            .exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

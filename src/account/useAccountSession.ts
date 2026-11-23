@@ -1,0 +1,268 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { AccountLineId } from "../configuration/preview";
+import {
+  clearCachedSignedInProjection,
+  readCachedSignedInProjection,
+  writeCachedSignedInProjection,
+} from "./accountProjectionCache";
+import { clearSessionAgeRecord, noteSessionActivity } from "./sessionAge";
+import {
+  idleSignedOutProjection,
+  openAccountWallet,
+  readAccountSessionSnapshot,
+  runAccountCommand,
+  type AccountCommand,
+  type AccountProjection,
+} from "./session";
+
+/// Masking a transient failure keeps a brief route hiccup from looking like a
+/// logout. Masking it indefinitely is worse: an authorization the user already
+/// approved in the browser keeps rendering as "waiting", with the real reason
+/// never shown, until the device code expires ten minutes later. Tolerate a
+/// short run of failures, then let the real status through.
+const TRANSIENT_TOLERANCE = 3;
+
+// A desktop launch can race the local service or the selected route becoming
+// ready. Do not turn that short startup window into a visible account error.
+// These delays keep the retry bounded while giving the service enough time to
+// settle. Structural failures are deliberately excluded because retrying them
+// cannot repair a mismatched server or an unavailable secure store.
+const INITIAL_INSPECTION_RETRY_DELAYS_MS = [250, 750, 1_500] as const;
+const RETRYABLE_INSPECTION_STATUSES: AccountProjection["status"][] = [
+  "backend_unavailable",
+  "network_error",
+  "invalid_response",
+];
+const TRANSIENT_STATUSES: AccountProjection["status"][] = [
+  ...RETRYABLE_INSPECTION_STATUSES,
+  "incompatible_server",
+  "secure_storage_unavailable",
+];
+
+function isTransientStatus(status: AccountProjection["status"]): boolean {
+  return TRANSIENT_STATUSES.includes(status);
+}
+
+function isRetryableInspectionStatus(
+  status: AccountProjection["status"],
+): boolean {
+  return RETRYABLE_INSPECTION_STATUSES.includes(status);
+}
+
+function waitForRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+type ExecuteOptions = {
+  /** Do not flip `loading` — keeps station-connect welcome / sign-in quiet. */
+  silent?: boolean;
+  /** First inspect after a keyring snapshot: single attempt, no startup retries. */
+  startup?: boolean;
+};
+
+export function useAccountSession(
+  lineId: AccountLineId,
+  options?: {
+    onSessionSnapshot?: (snapshot: {
+      hasStoredSession: boolean;
+      storedLineId: string | null;
+    }) => void;
+  },
+) {
+  const [projection, setProjection] = useState<AccountProjection | null>(null);
+  const [loading, setLoading] = useState(true);
+  /** 后台在查中转站：首页先画上次结果，不空等。 */
+  const [stationCheck, setStationCheck] = useState<
+    "idle" | "checking" | "ok" | "unreachable"
+  >("idle");
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [pollRevision, setPollRevision] = useState(0);
+  const projectionRef = useRef<AccountProjection | null>(null);
+  const authorizationLine = useRef(lineId);
+  const latest = useRef(0);
+  const transientStreak = useRef(0);
+  projectionRef.current = projection;
+
+  const execute = useCallback(
+    async (command: AccountCommand, options?: ExecuteOptions) => {
+      latest.current += 1;
+      const current = latest.current;
+      if (!options?.silent) setLoading(true);
+      if (command === "account_begin_authorization_v2") {
+        authorizationLine.current = lineId;
+        transientStreak.current = 0;
+      }
+      try {
+        let result: AccountProjection | null = null;
+        let transportFailure = false;
+        const previous = projectionRef.current;
+        const retryDelays =
+          command === "account_inspect_v2" &&
+          !options?.startup &&
+          (!previous || isTransientStatus(previous.status))
+            ? INITIAL_INSPECTION_RETRY_DELAYS_MS
+            : [];
+
+        for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+          try {
+            result = await runAccountCommand(
+              command,
+              command === "account_poll_authorization_v2"
+                ? authorizationLine.current
+                : lineId,
+            );
+            transportFailure = false;
+          } catch {
+            result = null;
+            transportFailure = true;
+          }
+
+          if (latest.current !== current) return result;
+          const retryable = result
+            ? isRetryableInspectionStatus(result.status)
+            : transportFailure;
+          if (!retryable || attempt === retryDelays.length) break;
+          await waitForRetry(retryDelays[attempt]);
+          if (latest.current !== current) return result;
+        }
+
+        if (latest.current === current) {
+          if (!result) {
+            transientStreak.current += 1;
+            setLastError("network_error");
+            return null;
+          }
+          const transient = isTransientStatus(result.status);
+          transientStreak.current = transient ? transientStreak.current + 1 : 0;
+          setLastError(transient ? result.reasonCode : null);
+          // 本地记账（#23）：signed_in 滚动最近使用时间；会话确认消失则清除。
+          if (result.status === "signed_in") {
+            noteSessionActivity();
+            writeCachedSignedInProjection(result);
+            setStationCheck("ok");
+          } else if (
+            result.status === "signed_out" ||
+            result.status === "session_expired"
+          ) {
+            clearSessionAgeRecord();
+            clearCachedSignedInProjection();
+            setStationCheck("idle");
+          } else if (transient) {
+            setStationCheck("unreachable");
+          }
+          setProjection((previous) =>
+            transient &&
+            transientStreak.current <= TRANSIENT_TOLERANCE &&
+            (previous?.status === "signed_in" ||
+              previous?.status === "authorization_pending")
+              ? previous
+              : result,
+          );
+        }
+        return result;
+      } finally {
+        if (latest.current === current) {
+          if (!options?.silent) setLoading(false);
+          // Retry scheduling must not depend on a changed projection object:
+          // transport exceptions and cached state can leave it identical.
+          setPollRevision((value) => value + 1);
+        }
+      }
+    },
+    [lineId],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const pending = projectionRef.current?.status === "authorization_pending";
+      if (pending) {
+        await execute("account_poll_authorization_v2");
+        return;
+      }
+      let snapshot: Awaited<ReturnType<typeof readAccountSessionSnapshot>>;
+      try {
+        snapshot = await readAccountSessionSnapshot();
+      } catch {
+        // 连本机的后台都没回话：照实报失败，别让界面一直停在「正在检查」。
+        if (cancelled) return;
+        setLoading(false);
+        setLastError("network_error");
+        return;
+      }
+      if (cancelled) return;
+      options?.onSessionSnapshot?.(snapshot);
+      if (!snapshot.hasStoredSession) {
+        clearCachedSignedInProjection();
+        setProjection(idleSignedOutProjection());
+        setLoading(false);
+        setStationCheck("idle");
+        setLastError(null);
+        return;
+      }
+      // 先画上次成功的账户状态，再后台检查中转站。站点再慢也不挡首页。
+      const cached = readCachedSignedInProjection();
+      if (cached) setProjection(cached);
+      setLoading(false);
+      setStationCheck("checking");
+      await execute("account_inspect_v2", { silent: true, startup: true });
+      if (!cancelled) {
+        setStationCheck((current) =>
+          current === "checking" ? "unreachable" : current,
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      latest.current += 1;
+    };
+  }, [execute]);
+
+  useEffect(() => {
+    if (projection?.status !== "authorization_pending" || loading) return;
+    if (projection.expiresAtEpochMs <= Date.now()) {
+      setProjection({
+        ...projection,
+        status: "expired",
+        reasonCode: "authorization_expired",
+      });
+      return;
+    }
+    const timer = window.setTimeout(
+      () => void execute("account_poll_authorization_v2"),
+      Math.max(1, projection.pollAfterSeconds) * 1000,
+    );
+    return () => window.clearTimeout(timer);
+  }, [execute, projection, pollRevision, loading]);
+
+  return {
+    projection,
+    loading,
+    stationCheck,
+    lastError,
+    refresh: () => {
+      setStationCheck("checking");
+      return execute("account_inspect_v2");
+    },
+    beginAuthorization: () => execute("account_begin_authorization_v2"),
+    openAuthorization: () => execute("account_open_authorization_v2"),
+    cancelAuthorization: () => execute("account_cancel_authorization_v2"),
+    logout: () => execute("account_logout_v2"),
+    openWallet: async () => {
+      try {
+        await openAccountWallet(lineId);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+export type AccountSessionController = Omit<
+  ReturnType<typeof useAccountSession>,
+  "lastError" | "stationCheck"
+> & {
+  lastError?: string | null;
+  stationCheck?: "idle" | "checking" | "ok" | "unreachable";
+};
