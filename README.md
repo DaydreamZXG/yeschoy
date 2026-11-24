@@ -28,7 +28,7 @@
 
 ## 三步就能用
 
-1. **连上你的站点**：输入站点网址，浏览器点一下允许就能连上（也支持直接粘密钥，或直连主流 AI 厂商）。[野菜API](https://yeschoy.com) 是内置预设站点之一，任意兼容的站点都能连。
+1. **连上你的站点**：输入站点网址，浏览器点一下允许就能连上（也支持直接粘密钥，或直连主流 AI 厂商）。[野菜API](https://yeschoy.com) 是内置预设站点之一，任意兼容的站点都能连。站长想让自己的站也能一键接上，看[站长接入指南](docs/station-owners.md)。
 2. **挑一位同学**：点开她的名片，能直接看到型号、价格方案和折扣，不藏着掖着。
 3. **派她进应用**：选好你电脑上装的 AI 应用，点一下就接好并自动打开；想换人、想看今天花了多少、想一键还原，都在界面里点两下搞定。
 
@@ -92,6 +92,7 @@ cd src-tauri && cargo test --lib   # Rust 测试
 - 提问与 Bug：[SUPPORT.md](./SUPPORT.md)
 - 隐私说明：[PRIVACY.md](./PRIVACY.md)
 - 安全披露：[SECURITY.md](./SECURITY.md)
+- 站长接入指南（new-api、sub2api 补丁）：[`docs/station-owners.md`](docs/station-owners.md)
 - 开源发布清单（含 secret scanning、社区 Release 步骤）：[`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md)
 
 ## 致谢与许可
@@ -122,7 +123,7 @@ Skip the terminal commands, config files, and protocol headaches. Enter your sta
 
 ### How It Works
 
-1. **Connect your station** — Enter any OpenAI-compatible station URL and authorize in the browser (or paste an API key / connect a provider directly). [Yeschoy (野菜API)](https://yeschoy.com) is included as a preset.
+1. **Connect your station** — Enter any OpenAI-compatible station URL and authorize in the browser (or paste an API key / connect a provider directly). [Yeschoy (野菜API)](https://yeschoy.com) is included as a preset. Running a station? See the [station owner guide](docs/station-owners.md).
 2. **Pick a classmate** — Check models, pricing plans, and discounts right on her card.
 3. **Send her in** — Choose an app on your machine and click once. Supported on macOS and Windows: Claude Code, Claude Desktop, Codex, WorkBuddy, DeepSeek Harness, DSH web, Pi, OpenCode, Cline, Hermes Agent, and OpenClaw.
 
@@ -144,6 +145,6 @@ See [`docs/download-page.md`](docs/download-page.md) for hosting notes. In-app a
 
 `pnpm install && pnpm dev`. Tests: `pnpm test:unit` and `cargo test --lib` in `src-tauri`.
 
-Community docs: [SUPPORT.md](./SUPPORT.md), [PRIVACY.md](./PRIVACY.md), [SECURITY.md](./SECURITY.md), [`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md).
+Community docs: [station owner guide](docs/station-owners.md), [SUPPORT.md](./SUPPORT.md), [PRIVACY.md](./PRIVACY.md), [SECURITY.md](./SECURITY.md), [`docs/OPEN_SOURCE.md`](docs/OPEN_SOURCE.md).
 
 Released under the [MIT License](LICENSE). Thanks to [CC Switch](https://github.com/farion1231/cc-switch) (MIT) — see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for exactly which code comes from it.
