@@ -1,7 +1,8 @@
 # yeschoy.app：落地页、下载页、一键连接页
 
-整站是 `public/` 目录里的静态文件，加上 `functions/` 里的两个 Cloudflare Pages Functions，
-部署在 Cloudflare Pages（项目根目录 = 仓库根目录，输出目录 = `public`，不需要构建命令）。
+整站是 `public/` 目录里的静态文件，加上 [`worker/index.js`](../worker/index.js) 处理
+`/api/latest` 和 `/dl/*`，部署成 Cloudflare Worker `yeschoy-app`（配置见
+[`wrangler.jsonc`](../wrangler.jsonc)，不需要构建命令）。
 
 ## 路径
 
@@ -19,16 +20,16 @@
 
 ## 下载地址怎么来
 
-[`functions/_lib/release.js`](../functions/_lib/release.js) 读最新 Release 的
-`latest.json`（版本号）和 `SHA256SUMS.txt`（安装包文件名），都走
-`github.com/…/releases/latest/download/`，不调 GitHub API，所以不受匿名调用次数限制。
+[`worker/release.js`](../worker/release.js) 先读
+`releases/latest/download/latest.json` 拿版本号，再读该版本的 `SHA256SUMS.txt` 拿安装包文件名，
+不调 GitHub API，所以不受匿名调用次数限制。
 结果在 Cloudflare 边缘缓存 10 分钟。发新版后不用改页面。
 
 应用内自动更新与本站无关，社区版直接读 GitHub Release 的 `latest.json`。
 
-## 本地预览
+## 本地预览和部署
 
 ```bash
-npx wrangler pages dev public --port 8788
-# http://127.0.0.1:8788/  /download/  /desktop/connect  /dl/windows  /api/latest
+npx wrangler@4 dev --port 8788      # http://127.0.0.1:8788/
+npx wrangler@4 deploy               # 需要 CLOUDFLARE_API_TOKEN（Workers 编辑权限）
 ```
