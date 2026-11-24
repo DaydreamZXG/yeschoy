@@ -654,6 +654,7 @@ export function KaifanApp() {
             setConnectOpen(true);
           }}
           onUndo={connections.restore}
+          onOpen={connections.open}
           onSettled={() => void connections.refresh()}
         />
         <Card

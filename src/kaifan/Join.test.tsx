@@ -1418,11 +1418,22 @@ describe("接入：应用多了不堆在一起", () => {
     expect(screen.getByRole("button", { name: /还有 4 个/ })).toBeTruthy();
   });
 
-  it("DSH 网页版退役：接过的点进来看得到，只能放回去，不能再接", async () => {
+  it("DSH 网页版退役：接过的点进来看得到，能打开、能放回去，不能再接", async () => {
+    const onOpen = vi.fn(async () => ({
+      status: "launch_failed" as const,
+      reasonCode: "",
+    }));
+    const onUndo = vi.fn(async () => ({}) as never);
     setup({
       initialApp: "dsh_web",
+      onOpen,
+      onUndo,
       connections: [
-        { toolId: "dsh_web", state: "connected" } as ToolConnection,
+        {
+          toolId: "dsh_web",
+          state: "connected",
+          restoreMode: "original",
+        } as ToolConnection,
       ],
     });
     await waitFor(() =>
@@ -1431,6 +1442,11 @@ describe("接入：应用多了不堆在一起", () => {
     expect(screen.getByTestId("kaifan-join-retired")).toHaveTextContent(
       "DeepSeek Harness",
     );
+    fireEvent.click(screen.getByTestId("kaifan-join-open-retired"));
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith("dsh_web"));
+    expect(await screen.findByText(/没打开，可以先「放回去」/)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("kaifan-join-undo"));
+    await waitFor(() => expect(onUndo).toHaveBeenCalledWith("dsh_web"));
   });
 
   it("别的应用：给出要填的地址和型号，能复制；不拿密钥出来，也不去接入", async () => {

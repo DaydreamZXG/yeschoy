@@ -15,6 +15,7 @@ import type {
   ConnectionResponse,
   ToolConnection,
 } from "../configuration/connections";
+import type { OpenResult } from "../configuration/launchApi";
 import type { AccountLineId } from "../configuration/preview";
 import { useActivationTask } from "../configuration/useActivationTask";
 import type { InstallationProgress } from "../installation/api";
@@ -98,6 +99,8 @@ interface Props {
   onReconnect: () => void;
   /** 把一个应用改回接入之前的样子（上次没做完、或者被别的工具改过时给这条路）。 */
   onUndo: (toolId: ActivationToolId) => Promise<ConnectionResponse>;
+  /** 打开已经接好的应用（退役的应用只剩这条路）。 */
+  onOpen?: (toolId: ActivationToolId) => Promise<OpenResult>;
   /** 这一屏还办不了的事（要系统确认的安装）：先去旧页面办。 */
   /** 接入做完（不管成没成）之后，让外面重新读一遍应用的状态。 */
   onSettled: () => void;
@@ -136,6 +139,7 @@ export function Join({
   onJoined,
   onReconnect,
   onUndo,
+  onOpen,
   onSettled,
 }: Props) {
   const { t } = useTranslation();
@@ -156,6 +160,8 @@ export function Join({
   const [app, setApp] = useState<ActivationToolId>(WORKBENCH_APPS[0].id);
   // 不常用的应用默认收着；「别的应用」不接入，只给要填的地址。
   const [moreApps, setMoreApps] = useState(false);
+  const [reopening, setReopening] = useState(false);
+  const [reopenFailed, setReopenFailed] = useState(false);
   const [other, setOther] = useState(false);
   const [who, setWho] = useState<RosterId>(current);
   const [chosenModel, setChosenModel] = useState("");
@@ -383,6 +389,7 @@ export function Join({
   const appInfo = findApp(app);
   // 退役的应用只能「放回去」，不能再接。
   const retired = isRetiredApp(app);
+  const kept = !!saved && saved.state !== "not_connected";
   const appName = appDisplayName(app, appInfo?.name ?? app, t);
   // 不常用的收起来；接过的、现在选着的不收。装没装不算：找应用是慢慢找到的，
   // 按它来的话这一排会在用户眼前跳。
@@ -580,6 +587,15 @@ export function Join({
     setSpotting(false);
     if (result === "cleared") return void look();
     setSpot(result);
+  };
+  // 退役的应用不能再接，接过的照样能打开。
+  const reopen = async () => {
+    if (!onOpen || reopening) return;
+    setReopening(true);
+    setReopenFailed(false);
+    const result = await onOpen(app).catch(() => null);
+    setReopening(false);
+    setReopenFailed(result?.status !== "opened");
   };
   // 不接了，改回接入之前的样子。上次没做完的那一半也由这一步收掉。
   const undo = async () => {
@@ -969,7 +985,12 @@ export function Join({
                     role="note"
                     data-testid="kaifan-join-retired"
                   >
-                    {t("kaifan.join.retired", { app: appName })}
+                    {t(
+                      reopenFailed
+                        ? "kaifan.join.openRetiredFailed"
+                        : "kaifan.join.retired",
+                      { app: appName },
+                    )}
                   </p>
                 ) : barred ? (
                   <p
@@ -1146,20 +1167,33 @@ export function Join({
                     </label>
                   )}
                   <i />
-                  {broken && saved && saved.restoreMode !== "none" && (
+                  {retired && onOpen && kept && !broken && (
                     <button
                       type="button"
-                      className="go alt"
-                      data-testid="kaifan-join-undo"
-                      onClick={() => void undo()}
+                      className="go"
+                      data-testid="kaifan-join-open-retired"
+                      disabled={reopening}
+                      onClick={() => void reopen()}
                     >
-                      {t(
-                        saved.restoreMode === "original"
-                          ? "kaifan.settings.restoreAction"
-                          : "kaifan.settings.removeAction",
-                      )}
+                      {t("kaifan.join.openRetired", { app: appName })}
                     </button>
                   )}
+                  {(broken || (retired && kept)) &&
+                    saved &&
+                    saved.restoreMode !== "none" && (
+                      <button
+                        type="button"
+                        className="go alt"
+                        data-testid="kaifan-join-undo"
+                        onClick={() => void undo()}
+                      >
+                        {t(
+                          saved.restoreMode === "original"
+                            ? "kaifan.settings.restoreAction"
+                            : "kaifan.settings.removeAction",
+                        )}
+                      </button>
+                    )}
                   {absent && selfInstall ? (
                     <button
                       type="button"
