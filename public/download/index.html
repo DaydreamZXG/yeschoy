@@ -3,91 +3,53 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="light dark" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#06123a" />
+  <link rel="icon" href="/site/logo.png" />
   <title>下载 YesChoy</title>
-  <link rel="stylesheet" href="/site/theme.css" />
+  <link rel="stylesheet" href="/site/landing.css" />
   <style>
-    body {
-      min-height: 100dvh;
-      display: grid;
-      place-items: center;
-      padding: 24px 16px;
-    }
-    main {
-      width: min(440px, 100%);
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: var(--radius-xl);
-      box-shadow: var(--shadow-float);
-      padding: 28px 24px 22px;
-    }
-    .brand-row {
-      display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
-    }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 1.35rem;
-      letter-spacing: -0.02em;
-      font-weight: 700;
-    }
-    .lede {
-      margin: 0 0 18px;
-      color: var(--muted);
-      line-height: 1.55;
-      font-size: 0.95rem;
-    }
-    [data-download-actions] {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-    [data-download-note],
-    [data-download-status] {
-      margin: 0 0 12px;
-      font-size: 0.85rem;
-      color: var(--muted);
-      line-height: 1.5;
-    }
-    footer {
-      margin-top: 18px;
-      padding-top: 14px;
-      border-top: 1px solid var(--line);
-      font-size: 0.82rem;
-      color: var(--muted);
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px 14px;
-    }
-    footer a {
-      color: var(--ink);
-      text-decoration: none;
-      font-weight: 550;
-    }
-    footer a:hover { text-decoration: underline; text-underline-offset: 2px; }
+    main { padding: 24px 0 0; }
+    .dl-hero { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
+    .dl-hero img { width: 88px; height: 132px; object-fit: cover; border-radius: 16px; }
+    .dl-hero h1 { margin: 0 0 4px; font-size: 30px; letter-spacing: -0.02em; }
+    .dl-hero p { margin: 0; color: var(--dim); }
   </style>
 </head>
 <body>
-  <main data-yeschoy-download>
-    <div class="brand-row">
-      <span class="mark" aria-hidden="true">Y</span>
-      <span style="font-weight:650;font-size:14px;">YesChoy</span>
+  <div class="sky" aria-hidden="true"></div>
+  <header class="top wrap">
+    <a class="brand" href="/">
+      <img src="/site/logo.png" alt="" width="32" height="32" />
+      <span>YesChoy</span>
+    </a>
+  </header>
+  <main class="wrap" id="download">
+    <div class="dl-hero">
+      <img src="/site/roster/ds.webp" alt="" />
+      <div>
+        <h1>下载 YesChoy</h1>
+        <p>吃饱喝足，这就开工！—— 小鲸</p>
+      </div>
     </div>
-    <h1>下载 YesChoy</h1>
-    <p class="lede">
-      九位性格各异的 AI 同学，点一下就去你的应用里干活。支持 macOS 和 Windows，下面已按你的电脑推荐好安装包。
-    </p>
-    <p data-download-status aria-live="polite"></p>
-    <p data-download-note></p>
-    <div data-download-actions></div>
-    <footer>
-      <a data-download-releases href="https://github.com/DaydreamZXG/yeschoy/releases">
-        在 GitHub 查看全部版本
+    <p class="sub" data-release-line>从 GitHub 下载最新正式版。</p>
+    <div class="downloads">
+      <a class="dl-card" href="/dl/windows" data-dl="windows">
+        <strong>Windows</strong>
+        <span>Windows 10 / 11，64 位</span>
+        <em data-size="windows">安装程序 .exe</em>
       </a>
-      <a href="/">返回首页</a>
-      <a href="/desktop/connect">一键连接</a>
-    </footer>
+      <a class="dl-card" href="/dl/mac" data-dl="mac">
+        <strong>macOS</strong>
+        <span>Apple 芯片和 Intel 通用</span>
+        <em data-size="mac">安装包 .dmg</em>
+      </a>
+    </div>
+    <p class="links">
+      <a href="https://github.com/DaydreamZXG/yeschoy/releases" rel="noopener">全部版本和更新说明</a>
+      <a href="/">认识 YesChoy 的同学们</a>
+    </p>
   </main>
-  <script src="/download.js" defer></script>
+  <script src="/site/landing.js" defer></script>
 </body>
 </html>

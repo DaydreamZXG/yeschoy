@@ -1,75 +1,34 @@
-# Desktop download page (`/download`) and site root (`/`)
+# yeschoy.app：落地页、下载页、一键连接页
 
-Public install entry for YesChoy desktop. Host this repository’s static assets on
-**`https://yeschoy.app`** (site root landing) and **`https://yeschoy.app/download`**
-(minimal download card). Partner edition may still use
-`https://ai.yeschoy.io/download?variant=partner`.
+整站是 `public/` 目录里的静态文件，加上 `functions/` 里的两个 Cloudflare Pages Functions，
+部署在 Cloudflare Pages（项目根目录 = 仓库根目录，输出目录 = `public`，不需要构建命令）。
 
-Visual language matches the desktop client (`src/theme/new-api.css`): lime `#c9fa10`
-+ near-black `#111111`, not the legacy warm-paper / vermilion cards.
+## 路径
 
-## Files in this repo
-
-| Asset | Role |
+| 路径 | 内容 |
 | --- | --- |
-| [`public/index.html`](../public/index.html) | One-page landing: brand, three steps, download, connect, open source, privacy |
-| [`public/site/theme.css`](../public/site/theme.css) | Shared tokens aligned with client UI |
-| [`public/download/index.html`](../public/download/index.html) | Minimal Chinese download card |
-| [`public/desktop/connect/index.html (also connect.html)`](../public/desktop/connect/index.html (also connect.html)) | Station one-click connect page (`/desktop/connect`) |
-| [`public/download.js`](../public/download.js) | Built from [`download/entry.ts`](../download/entry.ts) (`pnpm build:download`) |
-| [`public/connect.js`](../public/connect.js) | Built from [`connect/entry.ts`](../connect/entry.ts) (`pnpm build:connect`) |
-| [`download/yeschoyDownload.ts`](../download/yeschoyDownload.ts) | URL resolution logic (unit-tested) |
+| `/` | 落地页：九个角色、三步开始、能接的应用、下载、开源与隐私（[`public/index.html`](../public/index.html)） |
+| `/download/` | 精简下载页，客户端和一键连接页的“下载”都指向这里 |
+| `/desktop/connect` | 站点一键连接页（[`station-connect-embed.md`](./station-connect-embed.md)） |
+| `/dl/windows`、`/dl/mac` | 302 跳到 GitHub 最新正式版的安装包；读不到就跳 Releases 页 |
+| `/api/latest` | 最新版的 `version`、`publishedAt`、`notes` 和两个安装包的地址与 SHA-256 |
+| `/download.js`、`/connect.js` | 给站点嵌入用的脚本（`pnpm build:download` / `pnpm build:connect`） |
 
-## Path map (yeschoy.app)
+页面样式和脚本在 `public/site/`：`landing.css`、`landing.js`，角色立绘是
+`src/assets/roster/portrait` 缩到 480×720 的副本，应用图标从 `src/assets/icons` 复制。
 
-| Path | Content |
-| --- | --- |
-| `/` | Landing page |
-| `/download/` | Minimal download page |
-| `/desktop/connect` | One-click connect (same host as New API session cookie) |
-| `/download.js` / `/connect.js` | Hosted bundles |
-| `/site/theme.css` | Shared theme |
+## 下载地址怎么来
 
-Default public download URL in code: `https://yeschoy.app/download`.
+[`functions/_lib/release.js`](../functions/_lib/release.js) 读最新 Release 的
+`latest.json`（版本号）和 `SHA256SUMS.txt`（安装包文件名），都走
+`github.com/…/releases/latest/download/`，不调 GitHub API，所以不受匿名调用次数限制。
+结果在 Cloudflare 边缘缓存 10 分钟。发新版后不用改页面。
 
-## Resolution order (safe for ergou updates)
+应用内自动更新与本站无关，社区版直接读 GitHub Release 的 `latest.json`。
 
-1. **GitHub Releases** — latest release where `draft === false` and `published_at` is set.
-   Installers must match `yeschoy-<version>-{official|partner}-windows-x86_64-installer.exe`
-   and `…-macos-universal-installer.dmg`.
-2. **ergou manifest** — `https://ergou.qzz.io/releases/yeschoy-official.json` (or
-   `yeschoy-partner.json`).
-3. **Permanent ergou aliases** — `https://ergou.qzz.io/releases/{variant}/yeschoy-…-installer.*`
-
-The in-app Tauri updater **still uses** `src-tauri/update-channels.json` →
-`ergou.qzz.io/updates/{official|partner}/stable.json`. This page does not change
-that channel.
-
-### GitHub `v0.5.1` draft
-
-A **draft** GitHub release may exist without public installer URLs. Until it is
-**published**, the download page correctly falls back to ergou (currently serving
-0.5.1). Publishing the GitHub release is required before GitHub becomes the
-primary source for end users.
-
-## Operator checklist
-
-1. Run `pnpm build:download` and `pnpm build:connect`; deploy the whole `public/` tree
-   (including `index.html`, `site/`, `download/`, `desktop/`).
-2. Keep `connect.js` / station pages pointing at `https://yeschoy.app/download` (or a
-   same-origin `/download/`), not ergou update CDNs
-   ([`station-connect-embed.md`](./station-connect-embed.md)).
-3. After publishing a new GitHub release, smoke-test the page: primary button should
-   show “GitHub” in the subtitle.
-4. Partner edition: serve the same HTML on `ai.yeschoy.io` or pass `?variant=partner`.
-
-## Local smoke test
+## 本地预览
 
 ```bash
-pnpm build:download
-pnpm build:connect
-pnpm exec vite preview --outDir public --port 4173
-# open http://127.0.0.1:4173/
-# open http://127.0.0.1:4173/download/
-# open http://127.0.0.1:4173/desktop/connect.html
+npx wrangler pages dev public --port 8788
+# http://127.0.0.1:8788/  /download/  /desktop/connect  /dl/windows  /api/latest
 ```
