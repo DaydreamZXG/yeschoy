@@ -53,7 +53,6 @@ def snippet(release):
     lines = [f"# 由 refresh-release.py 生成：v{release['version']}"]
     for platform, item in release["installers"].items():
         lines.append(f"location = /dl/{platform} {{ return 302 {item['url']}; }}")
-    lines.append(f"location ^~ /dl/ {{ return 302 {RELEASES_PAGE}; }}")
     return "\n".join(lines) + "\n"
 
 
@@ -65,12 +64,26 @@ def write_if_changed(path, text):
     return True
 
 
-def main():
-    release = latest_release()
-    write_if_changed(WEB_ROOT / "api" / "latest.json", json.dumps(release, ensure_ascii=False))
-    if write_if_changed(SNIPPET, snippet(release)):
+def apply_snippet(text):
+    """换上新跳转并重载 nginx；失败就换回旧的，下次照样重试。"""
+    old = SNIPPET.read_text() if SNIPPET.exists() else None
+    if not write_if_changed(SNIPPET, text):
+        return
+    try:
         subprocess.run(["nginx", "-t", "-q"], check=True)
         subprocess.run(["systemctl", "reload", "nginx"], check=True)
+    except Exception:
+        if old is None:
+            SNIPPET.unlink()
+        else:
+            SNIPPET.write_text(old)
+        raise
+
+
+def main():
+    release = latest_release()
+    apply_snippet(snippet(release))
+    write_if_changed(WEB_ROOT / "api" / "latest.json", json.dumps(release, ensure_ascii=False))
 
 
 if __name__ == "__main__":
