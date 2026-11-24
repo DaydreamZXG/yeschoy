@@ -124,7 +124,7 @@ a:focus-visible, button:focus-visible { outline: 3px solid var(--acc); outline-o
 .dl-card em { color: var(--faint); font-size: 13px; font-style: normal; }
 .links { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 16px 0 0; font-size: 14px; color: var(--dim); }
 
-.trust { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.trust { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
 .trust a { display: grid; gap: 4px; padding: 20px; border: 1px solid var(--line); border-radius: 18px; background: var(--card); text-decoration: none; }
 .trust a:hover { border-color: rgba(255, 255, 255, 0.3); }
 .trust strong { font-size: 16px; }
