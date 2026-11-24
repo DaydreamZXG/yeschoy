@@ -9,23 +9,21 @@ const INSTALLER = {
   mac: /-macos-universal-installer\.dmg$/,
 };
 
-async function fetchText(name) {
-  const response = await fetch(`${LATEST}/${name}`, {
+async function fetchText(url) {
+  const response = await fetch(url, {
     headers: { "User-Agent": "yeschoy.app" },
     cf: { cacheTtl: 600, cacheEverything: true },
   });
-  if (!response.ok) throw new Error(`${name}: ${response.status}`);
+  if (!response.ok) throw new Error(`${url}: ${response.status}`);
   return response.text();
 }
 
 export async function latestRelease() {
-  const [manifest, sums] = await Promise.all([
-    fetchText("latest.json").then(JSON.parse),
-    fetchText("SHA256SUMS.txt"),
-  ]);
+  const manifest = JSON.parse(await fetchText(`${LATEST}/latest.json`));
   const version = String(manifest.version || "").replace(/^v/, "");
   if (!version) throw new Error("latest.json has no version");
   const base = `https://github.com/${REPO}/releases/download/v${version}`;
+  const sums = await fetchText(`${base}/SHA256SUMS.txt`);
   const files = sums
     .split("\n")
     .map((line) => line.trim().split(/\s+/))
