@@ -27,7 +27,13 @@ import {
   isImageGenerationModel,
   modelDisplayName,
 } from "../model-profiles/profile";
-import { WORKBENCH_APPS, appDisplayName } from "../workbench/appCatalog";
+import {
+  RETIRED_APPS,
+  WORKBENCH_APPS,
+  appDisplayName,
+  findApp,
+  isRetiredApp,
+} from "../workbench/appCatalog";
 import {
   joinModel,
   pickedPlan,
@@ -374,7 +380,9 @@ export function Join({
           (!!saved.billingGroup && saved.billingGroup !== billingGroup)
         ? "retune"
         : "same";
-  const appInfo = WORKBENCH_APPS.find((item) => item.id === app);
+  const appInfo = findApp(app);
+  // 退役的应用只能「放回去」，不能再接。
+  const retired = isRetiredApp(app);
   const appName = appDisplayName(app, appInfo?.name ?? app, t);
   // 不常用的收起来；接过的、现在选着的不收。装没装不算：找应用是慢慢找到的，
   // 按它来的话这一排会在用户眼前跳。
@@ -787,7 +795,18 @@ export function Join({
               )}
             </p>
             <div className="pickapps">
-              {WORKBENCH_APPS.map((item) => {
+              {[
+                ...WORKBENCH_APPS,
+                ...RETIRED_APPS.filter(
+                  (item) =>
+                    item.id === app ||
+                    connections.some(
+                      (entry) =>
+                        entry.toolId === item.id &&
+                        entry.state !== "not_connected",
+                    ),
+                ),
+              ].map((item) => {
                 const found = targets.find((entry) => entry.toolId === item.id);
                 const partial =
                   scan === "ready" && found?.status === "missing_runtime";
@@ -944,7 +963,15 @@ export function Join({
                     );
                   })}
                 </div>
-                {barred ? (
+                {retired ? (
+                  <p
+                    className="mend"
+                    role="note"
+                    data-testid="kaifan-join-retired"
+                  >
+                    {t("kaifan.join.retired", { app: appName })}
+                  </p>
+                ) : barred ? (
                   <p
                     className="mend"
                     role="note"
@@ -1137,7 +1164,7 @@ export function Join({
                     <button
                       type="button"
                       className="go"
-                      disabled={!modelId || barred || unpriced}
+                      disabled={!modelId || barred || retired || unpriced}
                       onClick={() => void fetchAndJoin()}
                     >
                       {t("kaifan.join.installGo", { app: appName })}
@@ -1166,6 +1193,7 @@ export function Join({
                         !modelId ||
                         !installationId ||
                         barred ||
+                        retired ||
                         unpriced ||
                         (app === "cursorpp" && !cursorppAllowed)
                       }
