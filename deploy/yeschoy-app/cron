@@ -1,0 +1,1 @@
+*/10 * * * * root /opt/yeschoy-app/refresh-release.py

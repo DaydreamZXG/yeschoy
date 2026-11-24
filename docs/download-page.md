@@ -1,8 +1,7 @@
 # yeschoy.app：落地页、下载页、一键连接页
 
-整站是 `public/` 目录里的静态文件，加上 [`worker/index.js`](../worker/index.js) 处理
-`/api/latest` 和 `/dl/*`，部署成 Cloudflare Worker `yeschoy-app`（配置见
-[`wrangler.jsonc`](../wrangler.jsonc)，不需要构建命令）。
+整站是 `public/` 目录里的静态文件，放在中转站那台服务器的 nginx 上（`/var/www/yeschoy-app`，
+配置见 [`deploy/yeschoy-app/nginx.conf`](../deploy/yeschoy-app/nginx.conf)）。
 
 ## 路径
 
@@ -20,16 +19,18 @@
 
 ## 下载地址怎么来
 
-[`worker/release.js`](../worker/release.js) 先读
-`releases/latest/download/latest.json` 拿版本号，再读该版本的 `SHA256SUMS.txt` 拿安装包文件名，
-不调 GitHub API，所以不受匿名调用次数限制。
-结果在 Cloudflare 边缘缓存 10 分钟。发新版后不用改页面。
+[`deploy/yeschoy-app/refresh-release.py`](../deploy/yeschoy-app/refresh-release.py) 每 10 分钟跑一次
+（`/etc/cron.d/yeschoy-app`）：先读 `releases/latest/download/latest.json` 拿版本号，再读该版本的
+`SHA256SUMS.txt` 拿安装包文件名，写出 `/api/latest.json` 和 nginx 片段
+`/etc/nginx/snippets/yeschoy-app-dl.conf`（`/dl/windows`、`/dl/mac` 的 302），变了才重载 nginx。
+不调 GitHub API。读失败时保留上一次的结果。发新版后不用改页面。
 
 应用内自动更新与本站无关，社区版直接读 GitHub Release 的 `latest.json`。
 
-## 本地预览和部署
+## 部署
 
 ```bash
-npx wrangler@4 dev --port 8788      # http://127.0.0.1:8788/
-npx wrangler@4 deploy               # 需要 CLOUDFLARE_API_TOKEN（Workers 编辑权限）
+rsync -a --delete --exclude api/ public/ 服务器:/var/www/yeschoy-app/
+# 首次：nginx.conf → /etc/nginx/conf.d/yeschoy-app.conf，refresh-release.py → /opt/yeschoy-app/，
+# cron → /etc/cron.d/yeschoy-app，再手动跑一次 refresh-release.py
 ```
