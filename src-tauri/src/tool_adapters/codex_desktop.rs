@@ -354,7 +354,7 @@ const PROFILE_FIELDS: [&str; 7] = [
 fn same_models(saved: &[u8], expected: &[u8]) -> bool {
     let strip = |bytes: &[u8]| {
         let mut value: Value = serde_json::from_slice(bytes).ok()?;
-        for model in value["models"].as_array_mut()? {
+        for model in value.get_mut("models")?.as_array_mut()? {
             let model = model.as_object_mut()?;
             for field in PROFILE_FIELDS {
                 model.remove(field);
@@ -786,6 +786,8 @@ mod tests {
         assert!(same_models(&old, &now));
         let other = catalog("gpt-6.1-sol", CodexTransport::DirectResponses).unwrap();
         assert!(!same_models(&other, &now));
+        assert!(!same_models(b"[1]", &now));
+        assert!(!same_models(b"7", &now));
     }
 
     #[test]
