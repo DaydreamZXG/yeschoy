@@ -465,7 +465,6 @@ pub(crate) fn apply_chat_effort(body: &mut Value, id: &str, effort: &str) {
 
 /// Adapt documented nested custom-provider efforts and DeepSeek's
 /// off toggle. Unknown models and unrelated payload fields remain untouched.
-#[allow(dead_code)] // Used by the vendored converter set, not by the desktop paths.
 pub(crate) fn normalize_chat_reasoning(body: &mut Value) -> bool {
     let Some(id) = body["model"].as_str().map(str::to_owned) else {
         return false;
@@ -1094,6 +1093,13 @@ mod tests {
         assert!(normalize_chat_reasoning(&mut disabled));
         assert_eq!(disabled["thinking"]["type"], "disabled");
         assert!(disabled.get("reasoning_effort").is_none());
+        let mut off = json!({"model":"deepseek-v4-flash","reasoning_effort":"none"});
+        assert!(normalize_chat_reasoning(&mut off));
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(off.get("reasoning_effort").is_none());
+        let mut medium = json!({"model":"deepseek-v4-flash","reasoning_effort":"medium"});
+        assert!(normalize_chat_reasoning(&mut medium));
+        assert_ne!(medium["reasoning_effort"], "medium");
     }
     #[test]
     fn ru043_registry_exact_ids_and_capabilities() {
