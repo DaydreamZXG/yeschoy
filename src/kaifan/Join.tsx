@@ -254,6 +254,7 @@ export function Join({
     if (!open) return;
     setOutcome(null);
     setApproved({});
+    setChosenPlan("");
     setRefused([]);
     setUndone(null);
     setWaiting(null);
