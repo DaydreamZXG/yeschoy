@@ -441,6 +441,14 @@ pub(crate) fn normalize_supported_effort(id: &str, effort: &str) -> Option<Strin
                 .min_by_key(|(rank, _)| *rank)
                 .map(|(_, candidate)| candidate.clone())
         })
+        // 只有 adaptive 这类不分高低的档位时，开思考就用它。
+        .or_else(|| {
+            model
+                .reasoning_levels
+                .iter()
+                .find(|candidate| *candidate != "none")
+                .cloned()
+        })
 }
 
 /// Explicit semantic effort is not a request to choose the strongest setting.
@@ -1106,6 +1114,10 @@ mod tests {
         assert_eq!(
             normalize_supported_effort("hy4-preview", "low").as_deref(),
             Some("high")
+        );
+        assert_eq!(
+            normalize_supported_effort("minimax-m3", "low").as_deref(),
+            Some("adaptive")
         );
     }
     #[test]
