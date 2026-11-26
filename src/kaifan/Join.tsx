@@ -624,6 +624,7 @@ export function Join({
   // 用户点头换方案：记下来（之后重启、再试都沿用它），马上用新方案去接。
   const regroup = () => {
     if (!nextGroup) return;
+    setChosenPlan("");
     setApproved((map) => ({ ...map, [approval]: nextGroup }));
     void begin(nextGroup);
   };
