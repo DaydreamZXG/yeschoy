@@ -165,6 +165,7 @@ export function Join({
   const [other, setOther] = useState(false);
   const [who, setWho] = useState<RosterId>(current);
   const [chosenModel, setChosenModel] = useState("");
+  const [chosenPlan, setChosenPlan] = useState("");
   const [install, setInstall] = useState("");
   const [scan, setScan] = useState<Scan>("loading");
   const [targets, setTargets] = useState<ActivationTarget[]>([]);
@@ -355,7 +356,9 @@ export function Join({
   const approval = `${app}\n${modelId}`;
   // 名片上挑的方案是用户自己定的，排在存过的前面；站点不再提供的不算。
   const wanted = pickedPlan(model, picks);
+  // 这次在接入面板里亲手换的方案，排在最前面。
   const billingGroup =
+    (offered.includes(chosenPlan) ? chosenPlan : undefined) ??
     approved[approval] ??
     fits(wanted) ??
     savedGroup ??
@@ -845,6 +848,7 @@ export function Join({
                       setApp(item.id);
                       setInstall("");
                       setChosenModel("");
+                      setChosenPlan("");
                       sound.pop(520);
                     }}
                   >
@@ -943,11 +947,29 @@ export function Join({
                       className="inp"
                       aria-label={t("kaifan.join.model")}
                       value={modelId}
-                      onChange={(event) => setChosenModel(event.target.value)}
+                      onChange={(event) => {
+                        setChosenModel(event.target.value);
+                        setChosenPlan("");
+                      }}
                     >
                       {ids.map((id) => (
                         <option key={id} value={id}>
                           {modelDisplayName(id)}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {modelId && offered.length > 1 && !gone && (
+                    <select
+                      className="inp"
+                      aria-label={t("kaifan.card.plan")}
+                      data-testid="kaifan-join-plan-select"
+                      value={billingGroup}
+                      onChange={(event) => setChosenPlan(event.target.value)}
+                    >
+                      {offered.map((id) => (
+                        <option key={id} value={id}>
+                          {planName(id)}
                         </option>
                       ))}
                     </select>
@@ -968,6 +990,7 @@ export function Join({
                         onClick={() => {
                           setWho(id);
                           setChosenModel("");
+                          setChosenPlan("");
                           sound.pop(500 + index * 45);
                         }}
                       >
