@@ -356,8 +356,11 @@ fn same_models(saved: &[u8], expected: &[u8]) -> bool {
         let mut value: Value = serde_json::from_slice(bytes).ok()?;
         for model in value.get_mut("models")?.as_array_mut()? {
             let model = model.as_object_mut()?;
+            // 只抹掉值：字段缺了 Codex 就读不了这份目录，得算被改过。
             for field in PROFILE_FIELDS {
-                model.remove(field);
+                if let Some(value) = model.get_mut(field) {
+                    *value = Value::Null;
+                }
             }
         }
         Some(value)
@@ -788,6 +791,12 @@ mod tests {
         assert!(!same_models(&other, &now));
         assert!(!same_models(b"[1]", &now));
         assert!(!same_models(b"7", &now));
+        let mut broken: Value = serde_json::from_slice(&now).unwrap();
+        broken["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("supported_reasoning_levels");
+        assert!(!same_models(&serde_json::to_vec(&broken).unwrap(), &now));
     }
 
     #[test]
