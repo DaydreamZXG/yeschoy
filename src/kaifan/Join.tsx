@@ -936,8 +936,22 @@ export function Join({
                     ))}
                   </p>
                 )}
-                <p className="lbl">
+                <p className="lbl pickat">
                   <b>{t("kaifan.join.whichOne")}</b>
+                  {ids && ids.length > 1 && modelId && (
+                    <select
+                      className="inp"
+                      aria-label={t("kaifan.join.model")}
+                      value={modelId}
+                      onChange={(event) => setChosenModel(event.target.value)}
+                    >
+                      {ids.map((id) => (
+                        <option key={id} value={id}>
+                          {modelDisplayName(id)}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </p>
                 <div className="cards">
                   {people.map((id, index) => {
@@ -1129,22 +1143,7 @@ export function Join({
                             was: worker ? t(`roster.${worker}.name`) : "",
                           })
                         : t("kaifan.join.summary", { name, app: appName })}
-                    {ids && ids.length > 1 ? (
-                      <select
-                        className="inp"
-                        aria-label={t("kaifan.join.model")}
-                        value={modelId}
-                        onChange={(event) => setChosenModel(event.target.value)}
-                      >
-                        {ids.map((id) => (
-                          <option key={id} value={id}>
-                            {modelDisplayName(id)}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      modelId && <em>{modelDisplayName(modelId)}</em>
-                    )}
+                    {modelId && <em>{modelDisplayName(modelId)}</em>}
                     {modelId && offered.length > 1 && !gone && (
                       <em data-testid="kaifan-join-plan">
                         {planName(billingGroup)}
