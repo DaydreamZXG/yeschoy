@@ -423,9 +423,11 @@ pub(crate) fn normalize_supported_effort(id: &str, effort: &str) -> Option<Strin
         };
     }
     let requested = effort_rank(effort)?;
+    // 要了思考就不能退成关掉：只有 none 和 high 的型号，low 要给 high。
     model
         .reasoning_levels
         .iter()
+        .filter(|candidate| *candidate != "none")
         .filter_map(|candidate| effort_rank(candidate).map(|rank| (rank, candidate)))
         .filter(|(rank, _)| *rank <= requested)
         .max_by_key(|(rank, _)| *rank)
@@ -434,6 +436,7 @@ pub(crate) fn normalize_supported_effort(id: &str, effort: &str) -> Option<Strin
             model
                 .reasoning_levels
                 .iter()
+                .filter(|candidate| *candidate != "none")
                 .filter_map(|candidate| effort_rank(candidate).map(|rank| (rank, candidate)))
                 .min_by_key(|(rank, _)| *rank)
                 .map(|(_, candidate)| candidate.clone())
@@ -1100,6 +1103,10 @@ mod tests {
         let mut medium = json!({"model":"deepseek-v4-flash","reasoning_effort":"medium"});
         assert!(normalize_chat_reasoning(&mut medium));
         assert_ne!(medium["reasoning_effort"], "medium");
+        assert_eq!(
+            normalize_supported_effort("hy4-preview", "low").as_deref(),
+            Some("high")
+        );
     }
     #[test]
     fn ru043_registry_exact_ids_and_capabilities() {
