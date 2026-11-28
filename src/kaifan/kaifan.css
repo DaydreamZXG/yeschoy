@@ -1838,9 +1838,11 @@ dialog.restore-dialog menu {
 .along ul {
   list-style: none;
   margin: 8px 0 0;
-  padding: 0;
+  padding: 0 4px 0 0;
   display: grid;
   gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
 }
 .along li {
   display: flex;
