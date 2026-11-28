@@ -415,8 +415,12 @@ export function Join({
                 ? plansOf(id).includes(billingGroup)
                 : plansOf(id).length > 0)),
         );
+  // WorkBuddy 的型号目录只加不删：已经接进去的型号不给去掉，免得留下一个用不了的型号。
+  const frozen = (id: string) =>
+    app === "workbuddy" && remembered.some((item) => item.modelId === id);
   const along = (id: string) =>
-    extras[id]?.on ?? remembered.some((item) => item.modelId === id);
+    frozen(id) ||
+    (extras[id]?.on ?? remembered.some((item) => item.modelId === id));
   const extraPlan = (id: string, group: string) => {
     if (room === "sameKey") return group;
     const offer = plansOf(id);
@@ -1121,6 +1125,7 @@ export function Join({
                                 <input
                                   type="checkbox"
                                   checked={on}
+                                  disabled={frozen(id)}
                                   onChange={(event) => {
                                     const checked = event.target.checked;
                                     setExtras((map) => ({

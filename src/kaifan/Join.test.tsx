@@ -436,6 +436,29 @@ describe("接入：选应用、选人、点一下", () => {
     ]);
   });
 
+  it("WorkBuddy 已经接进去的型号不给去掉勾", async () => {
+    found([target("claude_desktop"), target("workbuddy")]);
+    setup({
+      initialApp: "workbuddy",
+      connections: [
+        {
+          ...savedOn("default")[0],
+          toolId: "workbuddy",
+          models: [
+            { modelId: "claude-sonnet-4-5-20250929", billingGroup: "default" },
+            { modelId: "deepseek-v4", billingGroup: "default" },
+          ],
+        },
+      ],
+    });
+    await ready();
+    openAlong();
+    const boxes = within(alongBox()).getAllByRole("checkbox");
+    expect(boxes[0]).toBeChecked();
+    expect(boxes[0]).toBeDisabled();
+    expect(boxes[1]).not.toBeDisabled();
+  });
+
   it("原来名单里的型号方案不提供了：换成哪个先摊开给人看", async () => {
     setup({
       initialApp: "codex_desktop",
