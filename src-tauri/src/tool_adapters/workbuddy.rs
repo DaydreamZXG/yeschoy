@@ -104,10 +104,18 @@ fn configured_model(id: &str, key: &str, endpoint: &str, previous: Option<&Value
     Value::Object(model)
 }
 
+/// Our rows for this station: a model taken off the list must leave too,
+/// or WorkBuddy keeps offering it with a key that is about to be retired.
+fn ours(value: &Value, endpoint: &str) -> bool {
+    value.get("vendor").and_then(Value::as_str) == Some(VENDOR)
+        && value.get("url").and_then(Value::as_str) == Some(endpoint)
+}
+
 fn update_models(
     models: &mut Vec<Value>,
     endpoint: &str,
     credential: &ToolCredential,
+    dropped: &mut Vec<String>,
 ) -> Result<Vec<(String, String)>, ()> {
     let ids = credential.model_ids();
     let selected = ids.iter().collect::<std::collections::HashSet<_>>();
@@ -115,8 +123,10 @@ fn update_models(
     let mut retained = Vec::with_capacity(models.len() + ids.len());
     for value in std::mem::take(models) {
         let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
-        if let Some(id) = id.filter(|id| selected.contains(id)) {
+        if let Some(id) = id.clone().filter(|id| selected.contains(id)) {
             previous.entry(id).or_insert(value);
+        } else if ours(&value, endpoint) {
+            dropped.extend(id);
         } else {
             retained.push(value);
         }
@@ -146,19 +156,25 @@ fn render(
     credential: &ToolCredential,
 ) -> Result<RenderedCatalog, ()> {
     let mut root = parse(existing)?;
+    let mut dropped = Vec::new();
     let expected = match &mut root {
-        Value::Array(models) => update_models(models, endpoint, credential)?,
+        Value::Array(models) => update_models(models, endpoint, credential, &mut dropped)?,
         Value::Object(object) => {
             let models = object
                 .entry("models")
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
                 .ok_or(())?;
-            let expected = update_models(models, endpoint, credential)?;
+            let expected = update_models(models, endpoint, credential, &mut dropped)?;
             if let Some(available) = object
                 .get_mut("availableModels")
                 .and_then(Value::as_array_mut)
             {
+                available.retain(|value| {
+                    !value
+                        .as_str()
+                        .is_some_and(|id| dropped.iter().any(|gone| gone == id))
+                });
                 for (id, _) in &expected {
                     if !available.iter().any(|value| value.as_str() == Some(id)) {
                         available.push(id.clone().into());
@@ -342,6 +358,34 @@ mod tests {
         assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("127.0.0.1"));
         prepared.rollback().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn models_taken_off_the_list_leave_but_other_vendors_stay() {
+        let home = common::temporary_working_directory("workbuddy-dropped").unwrap();
+        let path = home.join(".workbuddy/models.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let url = "https://yeschoy.com/v1/chat/completions";
+        let original = format!(
+            r#"{{"models":[{{"id":"glm-5.3","vendor":"野菜API","url":"{url}","apiKey":"old"}},{{"id":"glm-5.3-mine","vendor":"Other","url":"{url}","apiKey":"keep"}}],"availableModels":["glm-5.3","glm-5.3-mine"]}}"#
+        );
+        std::fs::write(&path, &original).unwrap();
+        let mut prepared = prepare_catalog(&home, &credential()).unwrap();
+        prepared.commit().unwrap();
+        let root: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let ids = root["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["glm-5.3-mine", "gpt-6-astra", "deepseek-v4.1-flash"]);
+        let available = root["availableModels"].as_array().unwrap();
+        assert!(!available.iter().any(|v| v == "glm-5.3"));
+        assert!(available.iter().any(|v| v == "glm-5.3-mine"));
+        prepared.rollback().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
         std::fs::remove_dir_all(home).unwrap();
     }
 
