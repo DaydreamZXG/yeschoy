@@ -171,7 +171,8 @@ export function Join({
   const [extras, setExtras] = useState<
     Record<string, { on: boolean; plan?: string }>
   >({});
-  const [showAlong, setShowAlong] = useState(false);
+  /** 用户点过就照他的；没点过时，有型号的方案被换了就先摊开给他看。 */
+  const [showAlong, setShowAlong] = useState<boolean | null>(null);
   const [install, setInstall] = useState("");
   const [scan, setScan] = useState<Scan>("loading");
   const [targets, setTargets] = useState<ActivationTarget[]>([]);
@@ -185,7 +186,7 @@ export function Join({
   useEffect(() => setCursorppAllowed(false), [app, open]);
   useEffect(() => {
     setExtras({});
-    setShowAlong(false);
+    setShowAlong(null);
   }, [app, open]);
 
   const settled = useRef(onSettled);
@@ -434,6 +435,12 @@ export function Join({
     );
   };
   const brought = companions.filter(along);
+  // 原来名单里的型号，存过的方案站点不提供了：换成了哪个要让用户看得见。
+  const shifted = brought.some((id) => {
+    const was = remembered.find((item) => item.modelId === id)?.billingGroup;
+    return was !== undefined && was !== extraPlan(id, billingGroup);
+  });
+  const listed = showAlong ?? shifted;
   const bindings = (group: string): ModelBinding[] => [
     { modelId, billingGroup: group },
     ...brought.map((id) => ({
@@ -1094,15 +1101,15 @@ export function Join({
                     <button
                       type="button"
                       className="sm"
-                      aria-expanded={showAlong}
-                      onClick={() => setShowAlong((value) => !value)}
+                      aria-expanded={listed}
+                      onClick={() => setShowAlong(!listed)}
                     >
                       {brought.length > 0
                         ? t("kaifan.join.along", { count: brought.length })
                         : t("kaifan.join.alongNone")}
-                      {showAlong ? " ▴" : " ▾"}
+                      {listed ? " ▴" : " ▾"}
                     </button>
-                    {showAlong && (
+                    {listed && (
                       <ul>
                         {companions.map((id) => {
                           const offer = plansOf(id);
@@ -1151,7 +1158,7 @@ export function Join({
                         })}
                       </ul>
                     )}
-                    {showAlong && room === "sameKey" && (
+                    {listed && room === "sameKey" && (
                       <small>
                         {t("kaifan.join.alongSameKey", { app: appName })}
                       </small>
